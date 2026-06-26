@@ -52,68 +52,56 @@
       </node>
     </node>
 
-    <node oor:name="OfficeToolBar">
-      <node oor:name="org.codex.librecompleteai.toolbar" oor:op="replace">
-        <node oor:name="toggle" oor:op="replace">
-          <prop oor:name="Context" oor:type="xs:string">
-            <value>com.sun.star.text.TextDocument</value>
+    <node oor:name="Images">
+      <node oor:name="org.codex.librecompleteai.image.toggle" oor:op="replace">
+        <prop oor:name="URL" oor:type="xs:string">
+          <value>vnd.librecompleteai:toggle</value>
+        </prop>
+        <node oor:name="UserDefinedImages">
+          <prop oor:name="ImageSmall" oor:type="xs:hexBinary">
+            <value>424D7E000000000000003E000000280000001000000010000000010001000000000040000000130B0000130B00000200000000000000FFFFFF002D52A0000000000007F000000C1800001808000010000000100000001000000011C0000011C0000019C800000DD8000007F0000001C0000001C0000001C0000000000000</value>
           </prop>
-          <prop oor:name="URL" oor:type="xs:string">
-            <value>vnd.librecompleteai:toggle</value>
-          </prop>
-          <prop oor:name="Title" oor:type="xs:string">
-            <value xml:lang="en-US">LibreCompleteAI On/Off</value>
-          </prop>
-          <prop oor:name="Target" oor:type="xs:string">
-            <value>_self</value>
-          </prop>
-          <prop oor:name="ControlType" oor:type="xs:string">
-            <value>ToggleButton</value>
+          <prop oor:name="ImageBig" oor:type="xs:hexBinary">
+            <value>424DA6000000000000003E000000280000001A0000001A000000010001000000000068000000130B0000130B00000200000000000000FFFFFF002D52A0000000000000000000003F800000FFE00001E0F0000380380007001800060000000E0000000C0000000C0000000C0000000C0E00000E0E0000060E0000070E1000038E380003CE780001FFF000007FC000000E0000000E0000000E0000000000000000000000000000</value>
           </prop>
         </node>
-        <node oor:name="continuous" oor:op="replace">
-          <prop oor:name="Context" oor:type="xs:string">
-            <value>com.sun.star.text.TextDocument</value>
+      </node>
+      <node oor:name="org.codex.librecompleteai.image.continuous" oor:op="replace">
+        <prop oor:name="URL" oor:type="xs:string">
+          <value>vnd.librecompleteai:continuous</value>
+        </prop>
+        <node oor:name="UserDefinedImages">
+          <prop oor:name="ImageSmall" oor:type="xs:hexBinary">
+            <value>424D7E000000000000003E000000280000001000000010000000010001000000000040000000130B0000130B00000200000000000000FFFFFF002D52A000000000000000000000000000000000001E7800001FF800001FFC00001BDC00001FFE00001FF800001E7800000000000000000000000000000000000000000000</value>
           </prop>
-          <prop oor:name="URL" oor:type="xs:string">
-            <value>vnd.librecompleteai:continuous</value>
-          </prop>
-          <prop oor:name="Title" oor:type="xs:string">
-            <value xml:lang="en-US">Continuous Suggestions On/Off</value>
-          </prop>
-          <prop oor:name="Target" oor:type="xs:string">
-            <value>_self</value>
-          </prop>
-          <prop oor:name="ControlType" oor:type="xs:string">
-            <value>ToggleButton</value>
+          <prop oor:name="ImageBig" oor:type="xs:hexBinary">
+            <value>424DA6000000000000003E000000280000001A0000001A000000010001000000000068000000130B0000130B00000200000000000000FFFFFF002D52A0000000000000000000000000000000000000000000000000000000000007F1FC0007FBFC0007FFFC00077FDE00073F9E00073F9F80077FDF8007FFFF8007FBFC0007F1FC00000000000000000000000000000000000000000000000000000000000000000000000000</value>
           </prop>
         </node>
-        <node oor:name="complete" oor:op="replace">
-          <prop oor:name="Context" oor:type="xs:string">
-            <value>com.sun.star.text.TextDocument</value>
+      </node>
+      <node oor:name="org.codex.librecompleteai.image.complete" oor:op="replace">
+        <prop oor:name="URL" oor:type="xs:string">
+          <value>vnd.librecompleteai:complete</value>
+        </prop>
+        <node oor:name="UserDefinedImages">
+          <prop oor:name="ImageSmall" oor:type="xs:hexBinary">
+            <value>424D7E000000000000003E000000280000001000000010000000010001000000000040000000130B0000130B00000200000000000000FFFFFF002D52A000000000000000000000E0000020F0000020F8000020FC00003FFC00003FFC00003FFC000020F8000020F8000020FC000000080000000000000000000000000000</value>
           </prop>
-          <prop oor:name="URL" oor:type="xs:string">
-            <value>vnd.librecompleteai:complete</value>
-          </prop>
-          <prop oor:name="Title" oor:type="xs:string">
-            <value xml:lang="en-US">Complete Now</value>
-          </prop>
-          <prop oor:name="Target" oor:type="xs:string">
-            <value>_self</value>
+          <prop oor:name="ImageBig" oor:type="xs:hexBinary">
+            <value>424DA6000000000000003E000000280000001A0000001A000000010001000000000068000000130B0000130B00000200000000000000FFFFFF002D52A000000000000000000000000000000000001C0000001C0380001C03C0001C03E0001C03F0001C01F8001FFFFC001FFFFC001FFFFC001C00FC001C01F8001C03F0001C03E0001C03C8001C0388001C003C00000008000000000000000000000000000000000000000000</value>
           </prop>
         </node>
-        <node oor:name="settings" oor:op="replace">
-          <prop oor:name="Context" oor:type="xs:string">
-            <value>com.sun.star.text.TextDocument</value>
+      </node>
+      <node oor:name="org.codex.librecompleteai.image.settings" oor:op="replace">
+        <prop oor:name="URL" oor:type="xs:string">
+          <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$show_settings?language=Python&amp;location=user:uno_packages</value>
+        </prop>
+        <node oor:name="UserDefinedImages">
+          <prop oor:name="ImageSmall" oor:type="xs:hexBinary">
+            <value>424D7E000000000000003E000000280000001000000010000000010001000000000040000000130B0000130B00000200000000000000FFFFFF002D52A00001C0000039CE00003DDE00003FFE00001FFC00000E3800007DDF00007D5F00007DDF00000E3800001FFC00003FFE00003DDE000039CE000001C0000000000000</value>
           </prop>
-          <prop oor:name="URL" oor:type="xs:string">
-            <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$show_settings?language=Python&amp;location=user:uno_packages</value>
-          </prop>
-          <prop oor:name="Title" oor:type="xs:string">
-            <value xml:lang="en-US">LibreCompleteAI Settings</value>
-          </prop>
-          <prop oor:name="Target" oor:type="xs:string">
-            <value>_self</value>
+          <prop oor:name="ImageBig" oor:type="xs:hexBinary">
+            <value>424DA6000000000000003E000000280000001A0000001A000000010001000000000068000000130B0000130B00000200000000000000FFFFFF002D52A00000000000000E0000000E0000000E0000070E1C00078E3C0007CE7C0003FFF80001F9F00000E0E00000CE70003F9F7F803F9B3F803F9F7F8000CE700000E0E00001F9F00003FFF80007CE7C00078E3C00070E1C00000E0000000E0000000E00000000000000000000</value>
           </prop>
         </node>
       </node>
@@ -125,10 +113,10 @@
           <value>private:resource/toolbar/standardbar</value>
         </prop>
         <prop oor:name="MergePoint" oor:type="xs:string">
-          <value>.uno:BasicShapes</value>
+          <value/>
         </prop>
         <prop oor:name="MergeCommand" oor:type="xs:string">
-          <value>AddAfter</value>
+          <value>AddLast</value>
         </prop>
         <prop oor:name="MergeFallback" oor:type="xs:string">
           <value>AddLast</value>

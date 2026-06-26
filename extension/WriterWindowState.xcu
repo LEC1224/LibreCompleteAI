@@ -11,7 +11,7 @@
           <value xml:lang="en-US">LibreCompleteAI</value>
         </prop>
         <prop oor:name="Visible" oor:type="xs:boolean">
-          <value>true</value>
+          <value>false</value>
         </prop>
         <prop oor:name="Locked" oor:type="xs:boolean">
           <value>false</value>

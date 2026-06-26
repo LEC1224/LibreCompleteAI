@@ -53,6 +53,36 @@ class ExtensionMetadataTests(unittest.TestCase):
                 self.fail(value)
         self.assertTrue({"vnd.librecompleteai:toggle", "vnd.librecompleteai:continuous"} <= protocol_commands)
 
+    def test_toolbar_commands_are_icon_backed_and_merged_at_end(self):
+        tree = ET.parse(ADDONS)
+        ns = {"oor": "http://openoffice.org/2001/registry"}
+        oor_name = f"{{{ns['oor']}}}name"
+
+        addon_ui = tree.find(".//node[@oor:name='AddonUI']", ns)
+        self.assertIsNotNone(addon_ui)
+        self.assertIsNone(addon_ui.find("node[@oor:name='OfficeToolBar']", ns))
+
+        image_urls = {
+            (image.find("prop[@oor:name='URL']/value", ns).text or "")
+            for image in tree.findall(".//node[@oor:name='Images']/node", ns)
+        }
+        self.assertTrue(
+            {
+                "vnd.librecompleteai:toggle",
+                "vnd.librecompleteai:continuous",
+                "vnd.librecompleteai:complete",
+            }
+            <= image_urls
+        )
+
+        for image in tree.findall(".//node[@oor:name='Images']/node", ns):
+            self.assertTrue((image.find(".//prop[@oor:name='ImageSmall']/value", ns).text or "").strip())
+            self.assertTrue((image.find(".//prop[@oor:name='ImageBig']/value", ns).text or "").strip())
+
+        merge_command = tree.find(".//node[@oor:name='OfficeToolbarMerging']//prop[@oor:name='MergeCommand']/value", ns)
+        self.assertIsNotNone(merge_command)
+        self.assertEqual(merge_command.text, "AddLast")
+
 
 if __name__ == "__main__":
     unittest.main()

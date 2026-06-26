@@ -94,13 +94,13 @@ If the API key field is left empty, LibreCompleteAI can still use an `OPENAI_API
 
 ## Use
 
-In Writer, use the `LibreCompleteAI On/Off` toolbar button, or choose:
+In Writer, use the `LibreCompleteAI On/Off` icon on the standard toolbar, or choose:
 
 ```text
 Tools > Add-ons > Toggle LibreCompleteAI
 ```
 
-The toolbar button stays pressed while LibreCompleteAI is enabled for the current Writer window. Then press Tab while the cursor is in document text. The extension sends a small amount of text before and after the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
+The toolbar icon stays pressed while LibreCompleteAI is enabled for the current Writer window. Then press Tab while the cursor is in document text. The extension sends a small amount of text before and after the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
 
 For automatic background suggestions, use the `Continuous Suggestions On/Off` toolbar button, or choose:
 
@@ -108,7 +108,7 @@ For automatic background suggestions, use the `Continuous Suggestions On/Off` to
 Tools > Add-ons > Toggle Continuous Suggestions
 ```
 
-The `Complete Now` toolbar button asks for one suggestion immediately.
+The `Complete Now` toolbar icon asks for one suggestion immediately. Hover over any LibreCompleteAI icon to see the full command name.
 
 When a preview is visible:
 
@@ -118,7 +118,7 @@ When a preview is visible:
 
 While enabled, plain Tab is consumed by the extension. Toggle LibreCompleteAI off to restore Writer's normal Tab behavior.
 
-If the toolbar does not appear after installing or upgrading, enable it from `View > Toolbars > LibreCompleteAI`.
+The icons are added to the right side of Writer's standard toolbar. If they do not appear after upgrading, restart LibreOffice once after reinstalling the `.oxt`.
 
 ## Notes
 
