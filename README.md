@@ -117,6 +117,8 @@ The `Complete` toolbar button asks for one suggestion immediately. `Settings` op
 When a preview is visible:
 
 - Press Tab again to accept it.
+- Press Right Arrow to accept the next ghost-text character.
+- Press Ctrl+Right Arrow to accept the next ghost-text word.
 - Press Esc to dismiss it.
 - Keep typing to dismiss it and continue with your own text.
 

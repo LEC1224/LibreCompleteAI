@@ -126,6 +126,107 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(doc.view_cursor.CharColor, 0x123456)
         self.assertEqual(doc.view_cursor.CharPosture, "NONE")
 
+    def test_partial_ghost_acceptance_updates_remaining_range(self):
+        module = load_module()
+
+        class Text:
+            def __init__(self, value):
+                self.value = value
+
+            def createTextCursorByRange(self, text_range):
+                return Range(self, text_range.start, text_range.end)
+
+        class Range:
+            def __init__(self, text, start, end):
+                self.text = text
+                self.start = start
+                self.end = end
+                self.CharColor = 0x999999
+                self.CharPosture = "ITALIC"
+
+            def getString(self):
+                return self.text.value[self.start : self.end]
+
+            def setString(self, value):
+                self.text.value = self.text.value[: self.start] + value + self.text.value[self.end :]
+                self.end = self.start + len(value)
+
+            def getStart(self):
+                return Range(self.text, self.start, self.start)
+
+            def getEnd(self):
+                return Range(self.text, self.end, self.end)
+
+            def getText(self):
+                return self.text
+
+            def goRight(self, count, expand):
+                if self.end + count > len(self.text.value):
+                    return False
+                if expand:
+                    self.end += count
+                else:
+                    self.start = self.end + count
+                    self.end = self.start
+                return True
+
+        class Doc:
+            def __init__(self):
+                self.view_cursor = Range(text, 0, 0)
+
+        text = Text("ghost words")
+        doc = Doc()
+        original_view_cursor = module._view_cursor
+        original_move = module._move_view_cursor_to_range
+        module._view_cursor = lambda current_doc: current_doc.view_cursor
+        module._move_view_cursor_to_range = lambda current_doc, text_range: None
+        try:
+            ghost = module.GhostCompletion(
+                doc,
+                Range(text, 0, len(text.value)),
+                "ghost words",
+                {"CharColor": 0x123456, "CharPosture": "NONE"},
+            )
+            self.assertFalse(ghost.accept_prefix(module._next_ghost_word_count(ghost.completion)))
+        finally:
+            module._view_cursor = original_view_cursor
+            module._move_view_cursor_to_range = original_move
+
+        self.assertEqual(text.value, "ghost words")
+        self.assertEqual(ghost.completion, " words")
+        self.assertEqual(ghost.text_range.getString(), " words")
+
+    def test_partial_ghost_word_count_includes_leading_space(self):
+        module = load_module()
+        self.assertEqual(module._next_ghost_char_count(" hello"), 1)
+        self.assertEqual(module._next_ghost_word_count(" hello world"), 6)
+        self.assertEqual(module._next_ghost_word_count(" long-form writing"), 10)
+        self.assertEqual(module._next_ghost_word_count(", and then"), 1)
+
+    def test_key_handler_partially_accepts_ghost_with_right_arrow(self):
+        module = load_module()
+
+        class Event:
+            def __init__(self, key_code, modifiers=0):
+                self.KeyCode = key_code
+                self.Modifiers = modifiers
+                self.KeyChar = ""
+
+        calls = []
+        original_has_ghost = module._has_ghost
+        original_accept_partial = module._accept_partial_ghost
+        module._has_ghost = lambda doc: True
+        module._accept_partial_ghost = lambda doc, unit: calls.append(unit) or True
+        try:
+            handler = module.LibreCompleteAIKeyHandler(object())
+            self.assertTrue(handler.keyPressed(Event(module.RIGHT)))
+            self.assertTrue(handler.keyPressed(Event(module.RIGHT, module.MOD1)))
+        finally:
+            module._has_ghost = original_has_ghost
+            module._accept_partial_ghost = original_accept_partial
+
+        self.assertEqual(calls, ["char", "word"])
+
     def test_continuous_trigger_uses_writing_boundaries(self):
         module = load_module()
 

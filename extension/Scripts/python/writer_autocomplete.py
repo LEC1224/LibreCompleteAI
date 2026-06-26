@@ -11,7 +11,12 @@ try:
     import unohelper
     from com.sun.star.awt import XAdjustmentListener, XKeyHandler
     from com.sun.star.awt.FontSlant import ITALIC
-    from com.sun.star.awt.Key import ESCAPE, TAB
+    from com.sun.star.awt.Key import ESCAPE, RIGHT, TAB
+    from com.sun.star.awt.KeyModifier import MOD1
+    try:
+        from com.sun.star.awt.KeyModifier import MOD3
+    except Exception:
+        MOD3 = 8
 except Exception:
     uno = None
 
@@ -28,7 +33,10 @@ except Exception:
         pass
 
     ESCAPE = 1281
+    RIGHT = 1027
     TAB = 1282
+    MOD1 = 2
+    MOD3 = 8
     ITALIC = "ITALIC"
 
 
@@ -817,6 +825,37 @@ class GhostCompletion:
             _move_view_cursor_to_range(self.doc, end)
             _restore_insertion_properties(self.doc, end, self.original_properties)
 
+    def accept_prefix(self, count):
+        if not self.matches_document():
+            return True
+
+        count = max(0, min(int(count), len(self.completion)))
+        if count <= 0:
+            return False
+        if count >= len(self.completion):
+            self.accept()
+            self.completion = ""
+            return True
+
+        text = self.text_range.getText()
+        accepted = text.createTextCursorByRange(self.text_range.getStart())
+        if not accepted.goRight(count, True):
+            return False
+        _apply_properties(accepted, self.original_properties)
+
+        remaining = self.completion[count:]
+        remaining_range = text.createTextCursorByRange(accepted.getEnd())
+        if not remaining_range.goRight(len(remaining), True):
+            return False
+        _apply_ghost_style(remaining_range)
+
+        self.text_range = remaining_range
+        self.completion = remaining
+        start = remaining_range.getStart()
+        _move_view_cursor_to_range(self.doc, start)
+        _restore_insertion_properties(self.doc, start, self.original_properties)
+        return False
+
     def discard(self):
         if not self.matches_document():
             return
@@ -837,6 +876,53 @@ def _accept_ghost(doc):
         ghost.accept()
         return True
     return False
+
+
+def _accept_partial_ghost(doc, unit):
+    key = _doc_key(doc)
+    ghost = _GHOSTS.get(key)
+    if not ghost:
+        return False
+
+    if unit == "word":
+        count = _next_ghost_word_count(ghost.completion)
+    else:
+        count = _next_ghost_char_count(ghost.completion)
+
+    completed = ghost.accept_prefix(count)
+    if completed:
+        _GHOSTS.pop(key, None)
+    return True
+
+
+def _next_ghost_char_count(text):
+    return 1 if text else 0
+
+
+def _next_ghost_word_count(text):
+    if not text:
+        return 0
+
+    index = 0
+    length = len(text)
+    while index < length and text[index].isspace():
+        index += 1
+
+    if index >= length:
+        return index
+
+    if _is_word_body_char(text[index]):
+        while index < length and _is_word_body_char(text[index]):
+            index += 1
+        return index
+
+    while index < length and not text[index].isspace() and not _is_word_body_char(text[index]):
+        index += 1
+    return index
+
+
+def _is_word_body_char(char):
+    return char.isalnum() or char in "_'’-"
 
 
 def _discard_ghost(doc):
@@ -1201,6 +1287,12 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
                 if key_code == ESCAPE and modifiers == 0:
                     _discard_ghost(self.doc)
                     return True
+                if key_code == RIGHT and modifiers == 0:
+                    _accept_partial_ghost(self.doc, "char")
+                    return True
+                if key_code == RIGHT and _is_ctrl_only_modifier(modifiers):
+                    _accept_partial_ghost(self.doc, "word")
+                    return True
                 _discard_ghost(self.doc)
                 return False
 
@@ -1255,6 +1347,11 @@ def _is_continuous_typing_event(event):
     if not char:
         return False
     return char.isspace() or char.isprintable()
+
+
+def _is_ctrl_only_modifier(modifiers):
+    ctrl_modifiers = MOD1 | MOD3
+    return bool(modifiers & ctrl_modifiers) and not bool(modifiers & ~ctrl_modifiers)
 
 
 def is_autocomplete_enabled(doc=None):
