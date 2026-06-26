@@ -29,6 +29,7 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(settings["provider"], "openai")
         self.assertEqual(settings["openai_base_url"], "https://api.openai.com/v1")
         self.assertEqual(settings["continuous_suggestions"], "false")
+        self.assertEqual(settings["allow_reasoning"], "false")
         self.assertEqual(settings["max_context_words"], "600")
         self.assertEqual(settings["prediction_words"], "24")
 
@@ -54,6 +55,7 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIn("The room was quiet", joined)
         self.assertIn("afterward.", joined)
         self.assertIn("Aim for 7 words", joined)
+        self.assertIn("Do not reason", joined)
 
     def test_context_compression_summarizes_older_context(self):
         module = load_module()
@@ -363,7 +365,63 @@ class WriterAutocompleteTests(unittest.TestCase):
 
         payload = calls[0][1]
         self.assertEqual(payload["max_completion_tokens"], 32)
+        self.assertEqual(payload["reasoning_effort"], "minimal")
         self.assertNotIn("max_tokens", payload)
+
+    def test_request_openai_skips_reasoning_effort_when_allowed(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append((url, payload, headers))
+            return {"choices": [{"message": {"content": "the next line"}}]}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "openai_api_key": "sk-test",
+                    "openai_model": "gpt-5.4-mini",
+                    "allow_reasoning": "true",
+                }
+            )
+            self.assertEqual(module._request_openai("before", "after", settings), "the next line")
+        finally:
+            module._post_json = original
+
+        self.assertNotIn("reasoning_effort", calls[0][1])
+
+    def test_request_openai_falls_back_when_reasoning_effort_is_unsupported(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(dict(payload))
+            if len(calls) == 1:
+                raise module._HttpJsonError(
+                    400,
+                    url,
+                    '{"error":{"code":"unsupported_parameter","param":"reasoning_effort"}}',
+                )
+            return {"choices": [{"message": {"content": "fallback line"}}]}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "openai_api_key": "sk-test",
+                    "openai_model": "compatible-model",
+                    "max_tokens": "24",
+                }
+            )
+            self.assertEqual(module._request_openai("before", "after", settings), "fallback line")
+        finally:
+            module._post_json = original
+
+        self.assertEqual(calls[0]["reasoning_effort"], "minimal")
+        self.assertNotIn("reasoning_effort", calls[1])
 
     def test_request_openai_falls_back_to_max_tokens_for_compatible_servers(self):
         module = load_module()
@@ -397,10 +455,54 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertNotIn("max_tokens", calls[0])
         self.assertEqual(calls[1]["max_tokens"], 24)
         self.assertNotIn("max_completion_tokens", calls[1])
+        self.assertEqual(calls[1]["reasoning_effort"], "minimal")
+
+    def test_request_ollama_disables_thinking_by_default(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append((url, payload, headers))
+            return {"message": {"content": "the next line", "thinking": "hidden scratchpad"}}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings({"provider": "ollama", "ollama_model": "qwen3"})
+            self.assertEqual(module._request_ollama("before", "after", settings), "the next line")
+        finally:
+            module._post_json = original
+
+        self.assertIs(calls[0][1]["think"], False)
+
+    def test_request_ollama_allows_thinking_when_enabled(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append((url, payload, headers))
+            return {"message": {"content": "the next line"}}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {"provider": "ollama", "ollama_model": "qwen3", "allow_reasoning": "true"}
+            )
+            self.assertEqual(module._request_ollama("before", "after", settings), "the next line")
+        finally:
+            module._post_json = original
+
+        self.assertIs(calls[0][1]["think"], True)
 
     def test_clean_completion_strips_labels_and_fences(self):
         module = load_module()
         text = "```text\nCompletion: the candle bent toward the draft.\n```"
+        self.assertEqual(module.clean_completion(text), "the candle bent toward the draft.")
+
+    def test_clean_completion_strips_visible_reasoning_blocks(self):
+        module = load_module()
+        text = "<think>I should continue with a sentence.</think>\nCompletion: the candle bent toward the draft."
         self.assertEqual(module.clean_completion(text), "the candle bent toward the draft.")
 
     def test_clean_completion_removes_echoed_prefix_tail(self):

@@ -65,6 +65,7 @@ DEFAULT_SETTINGS = {
     "max_tokens": "96",
     "prediction_words": "24",
     "continuous_suggestions": "false",
+    "allow_reasoning": "false",
     "max_context_words": "600",
     "prefix_chars": "2400",
     "suffix_chars": "600",
@@ -81,12 +82,13 @@ SETTINGS_FIELDS = (
     "max_tokens",
     "prediction_words",
     "continuous_suggestions",
+    "allow_reasoning",
     "max_context_words",
     "prefix_chars",
     "suffix_chars",
     "writing_guidance",
 )
-BOOLEAN_SETTINGS = ("continuous_suggestions",)
+BOOLEAN_SETTINGS = ("continuous_suggestions", "allow_reasoning")
 SLIDER_SETTINGS = {
     "max_context_words": "max_context_words_slider",
     "prediction_words": "prediction_words_slider",

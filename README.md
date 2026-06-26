@@ -21,6 +21,7 @@ It is intended for LibreOffice 7.0 or newer.
 - Optional continuous suggestions after natural writing pauses.
 - Context compression for long documents, using the same selected LLM.
 - Tunable context length and prediction length controls.
+- A reasoning toggle, off by default, so autocomplete favors direct text generation.
 
 ## Build From Source
 
@@ -84,6 +85,7 @@ For Ollama use, set:
 Generation controls:
 
 - `Continuous autocomplete suggestions`: request suggestions in the background after you type a few new words. If you keep typing while the model thinks, LibreCompleteAI only shows the remaining ghost text when your typed words match the returned suggestion; otherwise it discards the stale suggestion and asks again from the new cursor context.
+- `Allow reasoning`: off by default. When off, LibreCompleteAI asks supported providers to avoid reasoning (`think: false` for Ollama and the lowest reasoning effort supported by OpenAI-compatible chat completions) and strips visible thinking blocks if a model returns them anyway.
 - `Context words`: how many words before the cursor should guide suggestions. Older text is compressed with the selected LLM when the context grows beyond this budget.
 - `Prediction words`: a soft guideline for how long each suggestion should be.
 - `Token cap`: the hard output token limit sent to OpenAI-compatible APIs or Ollama.

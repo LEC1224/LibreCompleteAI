@@ -49,6 +49,7 @@ DEFAULT_SETTINGS = {
     "max_tokens": "96",
     "prediction_words": "24",
     "continuous_suggestions": "false",
+    "allow_reasoning": "false",
     "max_context_words": "600",
     "prefix_chars": "2400",
     "suffix_chars": "600",
@@ -58,6 +59,8 @@ DEFAULT_SETTINGS = {
 SYSTEM_PROMPT = """You are an inline autocomplete engine for prose in LibreOffice Writer.
 Return only text that should be inserted at the cursor.
 Do not explain, label, quote, or wrap the completion.
+Do not think step by step, reason out loud, or include analysis.
+Do not output <think> blocks or hidden reasoning.
 Do not repeat text that is already before the cursor.
 Prefer a concise continuation: a phrase, clause, sentence, or short paragraph.
 Preserve the author's language, tone, tense, person, and formatting conventions.
@@ -98,12 +101,13 @@ SETTINGS_FIELDS = (
     "max_tokens",
     "prediction_words",
     "continuous_suggestions",
+    "allow_reasoning",
     "max_context_words",
     "prefix_chars",
     "suffix_chars",
     "writing_guidance",
 )
-BOOLEAN_SETTINGS = ("continuous_suggestions",)
+BOOLEAN_SETTINGS = ("continuous_suggestions", "allow_reasoning")
 SLIDER_SETTINGS = {
     "max_context_words": {
         "slider": "max_context_words_slider",
@@ -207,10 +211,12 @@ def _summary_token_limit(settings):
 def build_messages(prefix, suffix, settings):
     max_words = _prediction_words(settings)
     guidance = settings.get("writing_guidance") or DEFAULT_SETTINGS["writing_guidance"]
+    reasoning_instruction = _reasoning_instruction(settings)
     user_prompt = (
         "Continue the document at <cursor>.\n\n"
         "Writing guidance:\n"
         f"{guidance}\n\n"
+        f"{reasoning_instruction}\n\n"
         "Text before <cursor>:\n"
         "<before>\n"
         f"{prefix}\n"
@@ -230,10 +236,12 @@ def build_messages(prefix, suffix, settings):
 def build_summary_messages(text, settings):
     guidance = settings.get("writing_guidance") or DEFAULT_SETTINGS["writing_guidance"]
     target_words = max(40, min(180, _int_setting(settings, "max_context_words") // 4))
+    reasoning_instruction = _reasoning_instruction(settings)
     user_prompt = (
         "Summarize this earlier document context for later inline autocomplete.\n\n"
         "Writing guidance:\n"
         f"{guidance}\n\n"
+        f"{reasoning_instruction}\n\n"
         "Earlier context:\n"
         "<context>\n"
         f"{text}\n"
@@ -251,6 +259,7 @@ def clean_completion(text, prefix=""):
         return ""
 
     text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    text = _strip_reasoning_blocks(text)
     text = re.sub(r"^\s*```[a-zA-Z0-9_-]*\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
     text = text.strip("\n")
@@ -267,6 +276,18 @@ def clean_completion(text, prefix=""):
 
     text = _remove_prefix_echo(prefix, text)
     return text.rstrip()
+
+
+def _reasoning_instruction(settings):
+    if _bool_setting(settings, "allow_reasoning"):
+        return "Reasoning is allowed internally if the selected model needs it, but return only the final insertable text."
+    return "Do not reason, deliberate, explain, or think step by step. Produce only the next text."
+
+
+def _strip_reasoning_blocks(text):
+    text = re.sub(r"(?is)<think>.*?</think>\s*", "", text)
+    text = re.sub(r"(?is)^\s*(analysis|reasoning|thoughts?)\s*:\s*.*?(?=\n\s*(final|completion|suggestion)\s*:|\Z)", "", text)
+    return text
 
 
 def _remove_prefix_echo(prefix, completion):
@@ -316,19 +337,14 @@ def _request_openai_messages(messages, settings, token_limit=None, temperature=N
         "temperature": _float_setting(settings, "temperature") if temperature is None else temperature,
         "max_completion_tokens": token_limit or _completion_token_limit(settings),
     }
+    if not _bool_setting(settings, "allow_reasoning"):
+        payload["reasoning_effort"] = "minimal"
     headers = {
         "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",
     }
     url = base_url + "/chat/completions"
-    try:
-        response = _post_json(url, payload, headers)
-    except _HttpJsonError as exc:
-        if not _is_unsupported_parameter(exc, "max_completion_tokens"):
-            raise
-        fallback_payload = dict(payload)
-        fallback_payload["max_tokens"] = fallback_payload.pop("max_completion_tokens")
-        response = _post_json(url, fallback_payload, headers)
+    response = _post_openai_chat_completion(url, payload, headers)
     try:
         return response["choices"][0]["message"]["content"]
     except Exception:
@@ -353,6 +369,7 @@ def _request_ollama_messages(messages, settings, token_limit=None, temperature=N
         "model": model,
         "messages": messages,
         "stream": False,
+        "think": _ollama_think_setting(settings),
         "options": {
             "temperature": _float_setting(settings, "temperature") if temperature is None else temperature,
             "num_predict": token_limit or _completion_token_limit(settings),
@@ -360,9 +377,43 @@ def _request_ollama_messages(messages, settings, token_limit=None, temperature=N
     }
     response = _post_json(host + "/api/chat", payload, {"Content-Type": "application/json"})
     try:
-        return response["message"]["content"]
+        message = response["message"]
+        return message.get("content", "")
     except Exception:
         raise RuntimeError("Ollama response did not include a chat message.")
+
+
+def _ollama_think_setting(settings):
+    return True if _bool_setting(settings, "allow_reasoning") else False
+
+
+def _post_openai_chat_completion(url, payload, headers):
+    payload = dict(payload)
+    removed_reasoning = False
+    swapped_token_limit = False
+    while True:
+        try:
+            return _post_json(url, payload, headers)
+        except _HttpJsonError as exc:
+            if (
+                not removed_reasoning
+                and "reasoning_effort" in payload
+                and _is_unsupported_parameter(exc, "reasoning_effort")
+            ):
+                payload = dict(payload)
+                payload.pop("reasoning_effort", None)
+                removed_reasoning = True
+                continue
+            if (
+                not swapped_token_limit
+                and "max_completion_tokens" in payload
+                and _is_unsupported_parameter(exc, "max_completion_tokens")
+            ):
+                payload = dict(payload)
+                payload["max_tokens"] = payload.pop("max_completion_tokens")
+                swapped_token_limit = True
+                continue
+            raise
 
 
 def _compress_context_if_needed(prefix, settings, cache_key=None):
@@ -456,7 +507,7 @@ def _is_unsupported_parameter(error, parameter):
         body = json.loads(error.body)
         api_error = body.get("error", {})
         return (
-            api_error.get("code") == "unsupported_parameter"
+            api_error.get("code") in ("unsupported_parameter", "unsupported_value")
             and api_error.get("param") == parameter
         )
     except Exception:
@@ -1222,6 +1273,17 @@ def _create_settings_dialog(ctx, settings):
         235,
         "Continuous autocomplete suggestions",
         _bool_setting(settings, "continuous_suggestions"),
+    )
+
+    y += 18
+    _checkbox(
+        model,
+        "allow_reasoning",
+        10,
+        y - 1,
+        235,
+        "Allow reasoning",
+        _bool_setting(settings, "allow_reasoning"),
     )
 
     y += 20

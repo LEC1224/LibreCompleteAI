@@ -44,6 +44,7 @@ class OptionsHandlerTests(unittest.TestCase):
         settings = module.normalize_settings({"provider": "bad"})
         self.assertEqual(settings["provider"], "openai")
         self.assertEqual(settings["continuous_suggestions"], "false")
+        self.assertEqual(settings["allow_reasoning"], "false")
         self.assertEqual(settings["max_context_words"], "600")
 
     def test_normalize_settings_does_not_copy_env_api_key(self):
@@ -74,7 +75,10 @@ class OptionsHandlerTests(unittest.TestCase):
 
         class Window:
             def __init__(self):
-                self.controls = {"continuous_suggestions": Control()}
+                self.controls = {
+                    "continuous_suggestions": Control(),
+                    "allow_reasoning": Control(),
+                }
 
             def getControl(self, name):
                 return self.controls[name]
@@ -84,6 +88,8 @@ class OptionsHandlerTests(unittest.TestCase):
         self.assertEqual(module._get_control_bool(window, "continuous_suggestions"), "true")
         module._set_control_bool(window, "continuous_suggestions", "false")
         self.assertEqual(module._get_control_bool(window, "continuous_suggestions"), "false")
+        module._set_control_bool(window, "allow_reasoning", "true")
+        self.assertEqual(module._get_control_bool(window, "allow_reasoning"), "true")
 
     def test_secondary_toolbar_commands_follow_main_toggle_state(self):
         module = load_module()
