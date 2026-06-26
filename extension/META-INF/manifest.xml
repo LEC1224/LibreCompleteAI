@@ -7,6 +7,15 @@
     manifest:full-path="OptionsDialog.xcu"
     manifest:media-type="application/vnd.sun.star.configuration-data"/>
   <manifest:file-entry
+    manifest:full-path="ProtocolHandler.xcu"
+    manifest:media-type="application/vnd.sun.star.configuration-data"/>
+  <manifest:file-entry
+    manifest:full-path="WriterCommands.xcu"
+    manifest:media-type="application/vnd.sun.star.configuration-data"/>
+  <manifest:file-entry
+    manifest:full-path="WriterWindowState.xcu"
+    manifest:media-type="application/vnd.sun.star.configuration-data"/>
+  <manifest:file-entry
     manifest:full-path="LibreCompleteAI.components"
     manifest:media-type="application/vnd.sun.star.uno-components"/>
   <manifest:file-entry

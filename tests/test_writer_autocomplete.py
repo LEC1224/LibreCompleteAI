@@ -5,10 +5,18 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "extension" / "Scripts" / "python" / "writer_autocomplete.py"
+OPTIONS_HANDLER = Path(__file__).resolve().parents[1] / "extension" / "options_handler.py"
 
 
 def load_module():
     spec = importlib.util.spec_from_file_location("writer_autocomplete", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_options_handler():
+    spec = importlib.util.spec_from_file_location("options_handler", OPTIONS_HANDLER)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -129,6 +137,146 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertTrue(module._is_continuous_trigger(Event(" ")))
         self.assertTrue(module._is_continuous_trigger(Event(".")))
         self.assertFalse(module._is_continuous_trigger(Event("a")))
+
+    def test_reconcile_continuous_completion_keeps_remaining_match(self):
+        module = load_module()
+        state, remaining = module._reconcile_continuous_completion(
+            "This plugin",
+            "This plugin is designed",
+            " is designed to help you write faster",
+        )
+        self.assertEqual(state, "match")
+        self.assertEqual(remaining, " to help you write faster")
+
+    def test_reconcile_continuous_completion_rejects_different_typing(self):
+        module = load_module()
+        state, remaining = module._reconcile_continuous_completion(
+            "This plugin",
+            "This plugin can already",
+            " is designed to help you write faster",
+        )
+        self.assertEqual(state, "mismatch")
+        self.assertEqual(remaining, "")
+
+    def test_continuous_word_threshold_uses_words_since_last_request(self):
+        module = load_module()
+        key = "doc-test"
+        original = dict(module._LAST_AUTO_PREFIX)
+        try:
+            module._LAST_AUTO_PREFIX[key] = "The first sentence"
+            self.assertFalse(module._has_enough_new_words_for_continuous(key, "The first sentence adds two"))
+            self.assertTrue(module._has_enough_new_words_for_continuous(key, "The first sentence adds three words"))
+        finally:
+            module._LAST_AUTO_PREFIX.clear()
+            module._LAST_AUTO_PREFIX.update(original)
+
+    def test_enable_disable_helpers_are_silent_and_track_state(self):
+        module = load_module()
+
+        class Controller:
+            def __init__(self):
+                self.handlers = []
+
+            def addKeyHandler(self, handler):
+                self.handlers.append(handler)
+
+            def removeKeyHandler(self, handler):
+                self.handlers.remove(handler)
+
+        class Doc:
+            def __init__(self):
+                self.controller = Controller()
+
+            def supportsService(self, service_name):
+                return service_name == "com.sun.star.text.TextDocument"
+
+            def getCurrentController(self):
+                return self.controller
+
+        messages = []
+        original_message_box = module._message_box
+        module._message_box = lambda *args: messages.append(args)
+        try:
+            doc = Doc()
+            self.assertFalse(module.is_autocomplete_enabled(doc))
+            self.assertTrue(module.enable_autocomplete_for_doc(doc))
+            self.assertTrue(module.is_autocomplete_enabled(doc))
+            self.assertTrue(module.enable_autocomplete_for_doc(doc))
+            self.assertEqual(len(doc.controller.handlers), 1)
+            self.assertTrue(module.disable_autocomplete_for_doc(doc))
+            self.assertFalse(module.is_autocomplete_enabled(doc))
+            self.assertEqual(messages, [])
+        finally:
+            module._message_box = original_message_box
+
+    def test_document_key_prefers_runtime_uid_over_proxy_identity(self):
+        module = load_module()
+
+        class Controller:
+            def __init__(self):
+                self.handlers = []
+
+            def addKeyHandler(self, handler):
+                self.handlers.append(handler)
+
+            def removeKeyHandler(self, handler):
+                self.handlers.remove(handler)
+
+        class Doc:
+            def __init__(self, controller):
+                self.controller = controller
+
+            def getRuntimeUID(self):
+                return "same-libreoffice-document"
+
+            def supportsService(self, service_name):
+                return service_name == "com.sun.star.text.TextDocument"
+
+            def getCurrentController(self):
+                return self.controller
+
+        controller = Controller()
+        first_proxy = Doc(controller)
+        second_proxy = Doc(controller)
+        self.assertNotEqual(id(first_proxy), id(second_proxy))
+
+        self.assertTrue(module.enable_autocomplete_for_doc(first_proxy))
+        self.assertTrue(module.is_autocomplete_enabled(second_proxy))
+        self.assertTrue(module.disable_autocomplete_for_doc(second_proxy))
+        self.assertFalse(module.is_autocomplete_enabled(first_proxy))
+
+    def test_toggle_continuous_suggestions_for_doc_updates_settings(self):
+        module = load_module()
+        stored = module.normalize_settings({"continuous_suggestions": "false"})
+
+        original_load = module.load_settings
+        original_save = module.save_settings
+        module.load_settings = lambda: dict(stored)
+
+        def fake_save(settings):
+            stored.clear()
+            stored.update(module.normalize_settings(settings))
+            return dict(stored)
+
+        module.save_settings = fake_save
+        try:
+            self.assertTrue(module.toggle_continuous_suggestions_for_doc())
+            self.assertEqual(stored["continuous_suggestions"], "true")
+            self.assertFalse(module.toggle_continuous_suggestions_for_doc())
+            self.assertEqual(stored["continuous_suggestions"], "false")
+        finally:
+            module.load_settings = original_load
+            module.save_settings = original_save
+
+    def test_toolbar_protocol_url_command_parsing(self):
+        module = load_options_handler()
+
+        class Url:
+            Complete = "vnd.librecompleteai:continuous"
+            Path = ""
+            Name = ""
+
+        self.assertEqual(module._url_command(Url()), "continuous")
 
     def test_request_openai_uses_max_completion_tokens(self):
         module = load_module()

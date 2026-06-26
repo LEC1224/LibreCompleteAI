@@ -15,7 +15,8 @@ It is intended for LibreOffice 7.0 or newer.
 - OpenAI-compatible chat completions with an API key, base URL, and model label.
 - Ollama at a local or remote host, using any model you have downloaded.
 - A LibreOffice settings dialog for provider and generation options.
-- A fallback "Complete Now" menu command if you want to test completion without enabling the Tab hook.
+- Toolbar buttons for toggling LibreCompleteAI, toggling continuous suggestions, completing now, and opening settings.
+- A fallback "Complete Now" command if you want to test completion without enabling the Tab hook.
 - A ghost-text style preview: press Tab once to preview, press Tab again to accept.
 - Optional continuous suggestions after natural writing pauses.
 - Context compression for long documents, using the same selected LLM.
@@ -82,7 +83,7 @@ For Ollama use, set:
 
 Generation controls:
 
-- `Continuous autocomplete suggestions`: request suggestions automatically after natural writing boundaries such as spaces and punctuation. Leave it off to only request completions with Tab.
+- `Continuous autocomplete suggestions`: request suggestions in the background after you type a few new words. If you keep typing while the model thinks, LibreCompleteAI only shows the remaining ghost text when your typed words match the returned suggestion; otherwise it discards the stale suggestion and asks again from the new cursor context.
 - `Context words`: how many words before the cursor should guide suggestions. Older text is compressed with the selected LLM when the context grows beyond this budget.
 - `Prediction words`: a soft guideline for how long each suggestion should be.
 - `Token cap`: the hard output token limit sent to OpenAI-compatible APIs or Ollama.
@@ -93,13 +94,21 @@ If the API key field is left empty, LibreCompleteAI can still use an `OPENAI_API
 
 ## Use
 
-In Writer, choose:
+In Writer, use the `LibreCompleteAI On/Off` toolbar button, or choose:
 
 ```text
-Tools > Add-ons > Enable LibreCompleteAI
+Tools > Add-ons > Toggle LibreCompleteAI
 ```
 
-Then press Tab while the cursor is in document text. The extension sends a small amount of text before and after the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
+The toolbar button stays pressed while LibreCompleteAI is enabled for the current Writer window. Then press Tab while the cursor is in document text. The extension sends a small amount of text before and after the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
+
+For automatic background suggestions, use the `Continuous Suggestions On/Off` toolbar button, or choose:
+
+```text
+Tools > Add-ons > Toggle Continuous Suggestions
+```
+
+The `Complete Now` toolbar button asks for one suggestion immediately.
 
 When a preview is visible:
 
@@ -107,16 +116,12 @@ When a preview is visible:
 - Press Esc to dismiss it.
 - Keep typing to dismiss it and continue with your own text.
 
-While enabled, plain Tab is consumed by the extension. Use:
+While enabled, plain Tab is consumed by the extension. Toggle LibreCompleteAI off to restore Writer's normal Tab behavior.
 
-```text
-Tools > Add-ons > Disable LibreCompleteAI
-```
-
-to restore Writer's normal Tab behavior.
+If the toolbar does not appear after installing or upgrading, enable it from `View > Toolbars > LibreCompleteAI`.
 
 ## Notes
 
 LibreOffice Writer does not expose a native Cursor-style ghost text overlay through the simple macro API used here. This extension works around that by inserting tracked, temporary, pale text and deleting or committing it on the next key action.
 
-Because the preview is temporarily real document text, dismiss or accept it before saving. Disabling the extension from the Add-ons menu also removes any active preview. Network calls run synchronously, so Writer may pause briefly while the model responds.
+Because the preview is temporarily real document text, dismiss or accept it before saving. Toggling LibreCompleteAI off also removes any active preview. Manual Tab completions run synchronously, so Writer may pause briefly while the model responds; continuous suggestions run in the background.

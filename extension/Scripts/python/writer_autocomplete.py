@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -70,8 +71,13 @@ _BUSY_DOCS = set()
 _GHOSTS = {}
 _CONTEXT_SUMMARIES = {}
 _LAST_AUTO_REQUEST = {}
+_LAST_AUTO_PREFIX = {}
+_CONTINUOUS_REQUESTS = {}
+_CONTINUOUS_LOCK = threading.RLock()
+_CONTINUOUS_SEQUENCE = 0
 _DIALOG_LISTENERS = {}
-CONTINUOUS_MIN_INTERVAL_SECONDS = 1.5
+CONTINUOUS_MIN_INTERVAL_SECONDS = 0.75
+CONTINUOUS_TRIGGER_WORDS = 3
 SUMMARY_REFRESH_WORDS = 120
 SUMMARY_RECENT_MIN_WORDS = 80
 SUMMARY_RECENT_RATIO = 0.5
@@ -512,6 +518,18 @@ def _is_writer_document(doc):
 
 
 def _doc_key(doc):
+    for getter in (
+        lambda: doc.getRuntimeUID(),
+        lambda: doc.RuntimeUID,
+        lambda: doc.getURL(),
+        lambda: doc.URL,
+    ):
+        try:
+            value = getter()
+            if value:
+                return str(value)
+        except Exception:
+            pass
     return str(id(doc))
 
 
@@ -720,6 +738,171 @@ def complete_current_position(doc=None, preview=True, quiet=False):
         _BUSY_DOCS.discard(key)
 
 
+def _maybe_start_continuous_request(doc, event):
+    if _has_ghost(doc):
+        return False
+    settings = load_settings()
+    if not _bool_setting(settings, "continuous_suggestions"):
+        return False
+    if not _is_continuous_boundary(event):
+        return False
+    return _start_continuous_request(doc, settings)
+
+
+def _start_continuous_request(doc, settings, force=False):
+    key = _doc_key(doc)
+    if key in _BUSY_DOCS or _has_ghost(doc):
+        return False
+
+    now = time.time()
+    with _CONTINUOUS_LOCK:
+        if key in _CONTINUOUS_REQUESTS:
+            return False
+        if not force and now - _LAST_AUTO_REQUEST.get(key, 0) < CONTINUOUS_MIN_INTERVAL_SECONDS:
+            return False
+
+    try:
+        view_cursor, prefix, suffix = _get_text_context(doc, settings)
+    except Exception:
+        return False
+
+    if not force and not _has_enough_new_words_for_continuous(key, prefix):
+        return False
+
+    request_id = _next_continuous_request_id()
+    with _CONTINUOUS_LOCK:
+        if key in _CONTINUOUS_REQUESTS:
+            return False
+        _CONTINUOUS_REQUESTS[key] = {
+            "id": request_id,
+            "prefix": prefix,
+            "started": now,
+        }
+        _LAST_AUTO_REQUEST[key] = now
+        _LAST_AUTO_PREFIX[key] = prefix
+
+    worker = threading.Thread(
+        target=_continuous_request_worker,
+        args=(doc, key, request_id, prefix, suffix, dict(settings)),
+        daemon=True,
+    )
+    worker.start()
+    return True
+
+
+def _next_continuous_request_id():
+    global _CONTINUOUS_SEQUENCE
+    with _CONTINUOUS_LOCK:
+        _CONTINUOUS_SEQUENCE += 1
+        return _CONTINUOUS_SEQUENCE
+
+
+def _continuous_request_worker(doc, key, request_id, request_prefix, request_suffix, settings):
+    try:
+        completion = request_completion(request_prefix, request_suffix, settings, key)
+    except Exception:
+        completion = ""
+    _handle_continuous_response(doc, key, request_id, request_prefix, completion, settings)
+
+
+def _handle_continuous_response(doc, key, request_id, request_prefix, completion, settings):
+    with _CONTINUOUS_LOCK:
+        current = _CONTINUOUS_REQUESTS.get(key)
+        if not current or current.get("id") != request_id:
+            return
+        _CONTINUOUS_REQUESTS.pop(key, None)
+
+    if not completion or key not in _HANDLERS or _has_ghost(doc):
+        return
+
+    try:
+        current_settings = load_settings()
+        if not _bool_setting(current_settings, "continuous_suggestions"):
+            return
+        view_cursor, current_prefix, _suffix = _get_text_context(doc, current_settings)
+    except Exception:
+        return
+
+    state, remaining = _reconcile_continuous_completion(request_prefix, current_prefix, completion)
+    if state == "match":
+        if remaining.strip():
+            _show_ghost_completion(doc, view_cursor, remaining)
+        else:
+            _start_continuous_request(doc, current_settings, force=True)
+        return
+
+    if state == "mismatch":
+        _LAST_AUTO_PREFIX[key] = current_prefix
+        _start_continuous_request(doc, current_settings, force=True)
+
+
+def _reconcile_continuous_completion(request_prefix, current_prefix, completion):
+    if not current_prefix.startswith(request_prefix):
+        return "mismatch", ""
+
+    typed_tail = current_prefix[len(request_prefix) :]
+    remaining = _completion_remainder_after_typed(completion, typed_tail)
+    if remaining is None:
+        return "mismatch", ""
+    return "match", remaining
+
+
+def _completion_remainder_after_typed(completion, typed_tail):
+    if not typed_tail:
+        return completion
+    if completion.startswith(typed_tail):
+        return completion[len(typed_tail) :]
+
+    typed_index = 0
+    completion_index = 0
+    while typed_index < len(typed_tail) and completion_index < len(completion):
+        typed_char = typed_tail[typed_index]
+        completion_char = completion[completion_index]
+        if typed_char.isspace() and completion_char.isspace():
+            while typed_index < len(typed_tail) and typed_tail[typed_index].isspace():
+                typed_index += 1
+            while completion_index < len(completion) and completion[completion_index].isspace():
+                completion_index += 1
+            continue
+        if typed_char != completion_char:
+            return None
+        typed_index += 1
+        completion_index += 1
+
+    if typed_index == len(typed_tail):
+        return completion[completion_index:]
+    return None
+
+
+def _has_enough_new_words_for_continuous(key, current_prefix):
+    previous = _LAST_AUTO_PREFIX.get(key, "")
+    if not previous:
+        return _word_count(current_prefix) >= CONTINUOUS_TRIGGER_WORDS
+    if not current_prefix.startswith(previous):
+        return _word_count(current_prefix) >= CONTINUOUS_TRIGGER_WORDS
+    typed_tail = current_prefix[len(previous) :]
+    return _word_count(typed_tail) >= CONTINUOUS_TRIGGER_WORDS
+
+
+def _reset_continuous_baseline(doc, settings):
+    key = _doc_key(doc)
+    try:
+        _view_cursor, prefix, _suffix = _get_text_context(doc, settings)
+    except Exception:
+        prefix = ""
+    with _CONTINUOUS_LOCK:
+        _LAST_AUTO_PREFIX[key] = prefix
+        _LAST_AUTO_REQUEST.pop(key, None)
+        _CONTINUOUS_REQUESTS.pop(key, None)
+
+
+def _clear_continuous_state(key):
+    with _CONTINUOUS_LOCK:
+        _LAST_AUTO_PREFIX.pop(key, None)
+        _LAST_AUTO_REQUEST.pop(key, None)
+        _CONTINUOUS_REQUESTS.pop(key, None)
+
+
 class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
     def __init__(self, doc):
         self.doc = doc
@@ -749,21 +932,7 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
 
     def keyReleased(self, event):
         try:
-            if _has_ghost(self.doc):
-                return False
-            settings = load_settings()
-            if not _bool_setting(settings, "continuous_suggestions"):
-                return False
-            if not _is_continuous_trigger(event):
-                return False
-
-            key = _doc_key(self.doc)
-            now = time.time()
-            if now - _LAST_AUTO_REQUEST.get(key, 0) < CONTINUOUS_MIN_INTERVAL_SECONDS:
-                return False
-
-            _LAST_AUTO_REQUEST[key] = now
-            complete_current_position(self.doc, preview=True, quiet=True)
+            _maybe_start_continuous_request(self.doc, event)
         except Exception:
             return False
         return False
@@ -772,7 +941,7 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
         self.doc = None
 
 
-def _is_continuous_trigger(event):
+def _is_continuous_boundary(event):
     if getattr(event, "Modifiers", 0) != 0:
         return False
     key_code = getattr(event, "KeyCode", None)
@@ -787,50 +956,105 @@ def _is_continuous_trigger(event):
     return char in ".?!,:;)]}\"'"
 
 
-def enable_autocomplete(*args):
-    doc = _current_document()
+def _is_continuous_trigger(event):
+    return _is_continuous_boundary(event)
+
+
+def is_autocomplete_enabled(doc=None):
+    try:
+        doc = doc or _current_document()
+    except Exception:
+        return False
+    return _doc_key(doc) in _HANDLERS
+
+
+def enable_autocomplete_for_doc(doc, notify=False):
     if not _is_writer_document(doc):
-        _message_box(doc, EXTENSION_NAME, "Open a Writer document before enabling autocomplete.")
-        return
+        if notify:
+            _message_box(doc, EXTENSION_NAME, "Open a Writer document before enabling autocomplete.")
+        return False
 
     key = _doc_key(doc)
     if key in _HANDLERS:
-        _message_box(doc, EXTENSION_NAME, "LibreCompleteAI is already enabled for this Writer window.")
-        return
+        return True
 
     controller = _controller(doc)
     handler = LibreCompleteAIKeyHandler(doc)
     controller.addKeyHandler(handler)
     _HANDLERS[key] = (controller, handler)
-    _message_box(doc, EXTENSION_NAME, "LibreCompleteAI is enabled for this Writer window.")
+    _reset_continuous_baseline(doc, load_settings())
+    return True
 
 
-def disable_autocomplete(*args):
-    doc = _current_document()
+def disable_autocomplete_for_doc(doc, notify=False):
     key = _doc_key(doc)
     if key not in _HANDLERS:
-        _message_box(doc, EXTENSION_NAME, "LibreCompleteAI is not enabled for this Writer window.")
-        return
+        return False
 
     controller, handler = _HANDLERS.pop(key)
     try:
         _discard_ghost(doc)
+        _clear_continuous_state(key)
         controller.removeKeyHandler(handler)
     finally:
-        _message_box(doc, EXTENSION_NAME, "LibreCompleteAI is disabled for this Writer window.")
+        pass
+    return True
+
+
+def toggle_autocomplete_for_doc(doc, notify=False):
+    if _doc_key(doc) in _HANDLERS:
+        disable_autocomplete_for_doc(doc, notify=notify)
+        return False
+    return enable_autocomplete_for_doc(doc, notify=notify)
+
+
+def enable_autocomplete(*args):
+    doc = _current_document()
+    enable_autocomplete_for_doc(doc, notify=True)
+
+
+def disable_autocomplete(*args):
+    doc = _current_document()
+    disable_autocomplete_for_doc(doc, notify=True)
 
 
 def toggle_autocomplete(*args):
     doc = _current_document()
-    if _doc_key(doc) in _HANDLERS:
-        disable_autocomplete()
-    else:
-        enable_autocomplete()
+    toggle_autocomplete_for_doc(doc, notify=True)
 
 
 def complete_now(*args):
     doc = _current_document()
-    complete_current_position(doc, preview=_doc_key(doc) in _HANDLERS)
+    complete_current_position(doc, preview=is_autocomplete_enabled(doc))
+
+
+def is_continuous_suggestions_enabled(settings=None):
+    return _bool_setting(settings or load_settings(), "continuous_suggestions")
+
+
+def set_continuous_suggestions_enabled(enabled, doc=None):
+    settings = load_settings()
+    settings["continuous_suggestions"] = "true" if enabled else "false"
+    settings = save_settings(settings)
+    if doc is not None:
+        if enabled:
+            _reset_continuous_baseline(doc, settings)
+        else:
+            _clear_continuous_state(_doc_key(doc))
+    return enabled
+
+
+def toggle_continuous_suggestions_for_doc(doc=None):
+    enabled = not is_continuous_suggestions_enabled()
+    return set_continuous_suggestions_enabled(enabled, doc=doc)
+
+
+def toggle_continuous_suggestions(*args):
+    try:
+        doc = _current_document()
+    except Exception:
+        doc = None
+    toggle_continuous_suggestions_for_doc(doc)
 
 
 def show_settings(*args):
@@ -1148,5 +1372,6 @@ g_exportedScripts = (
     enable_autocomplete,
     disable_autocomplete,
     toggle_autocomplete,
+    toggle_continuous_suggestions,
     complete_now,
 )

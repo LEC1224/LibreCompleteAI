@@ -1,11 +1,16 @@
 import json
+import importlib.util
 import os
 
 try:
+    import uno
     import unohelper
     from com.sun.star.awt import XAdjustmentListener, XContainerWindowEventHandler
-    from com.sun.star.lang import XServiceInfo
+    from com.sun.star.frame import FeatureStateEvent, XDispatch, XDispatchProvider
+    from com.sun.star.lang import XInitialization, XServiceInfo
 except Exception:
+    uno = None
+
     class _UnoHelper:
         class Base(object):
             pass
@@ -22,11 +27,27 @@ except Exception:
     class XAdjustmentListener(object):
         pass
 
+    class XDispatch(object):
+        pass
+
+    class XDispatchProvider(object):
+        pass
+
+    class FeatureStateEvent(object):
+        pass
+
     class XServiceInfo(object):
+        pass
+
+    class XInitialization(object):
         pass
 
 
 SERVICE_NAME = "org.codex.librecompleteai.OptionsEventHandler"
+DISPATCH_SERVICE_NAME = "org.codex.librecompleteai.Dispatch"
+DISPATCH_PROTOCOL = "vnd.librecompleteai:"
+SUPPORTED_DISPATCH_COMMANDS = ("toggle", "continuous", "complete")
+_RUNTIME_MODULE = None
 DEFAULT_SETTINGS = {
     "provider": "openai",
     "openai_api_key": "",
@@ -177,6 +198,219 @@ class LibreCompleteAIOptionsEventHandler(unohelper.Base, XServiceInfo, XContaine
         return self.services
 
 
+class LibreCompleteAIDispatch(unohelper.Base, XServiceInfo, XInitialization, XDispatchProvider, XDispatch):
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.ImplementationName = DISPATCH_SERVICE_NAME
+        self.services = (DISPATCH_SERVICE_NAME, "com.sun.star.frame.ProtocolHandler")
+        self.listeners = []
+        self.frame = None
+
+    def initialize(self, args):
+        for arg in _flatten_initialization_args(args):
+            if arg is not None:
+                self.frame = arg
+                return
+
+    def queryDispatch(self, url, target_frame_name, search_flags):
+        if _url_command(url) in SUPPORTED_DISPATCH_COMMANDS:
+            return self
+        return None
+
+    def queryDispatches(self, requests):
+        return tuple(
+            self.queryDispatch(request.FeatureURL, request.FrameName, request.SearchFlags)
+            for request in requests
+        )
+
+    def dispatch(self, url, args):
+        command = _url_command(url)
+        runtime = _load_writer_runtime()
+        doc = self._current_writer_document(runtime)
+        if doc is None:
+            self._notify_all()
+            return
+
+        if command == "toggle":
+            runtime.toggle_autocomplete_for_doc(doc)
+        elif command == "continuous":
+            runtime.toggle_continuous_suggestions_for_doc(doc)
+        elif command == "complete":
+            runtime.complete_current_position(doc, preview=runtime.is_autocomplete_enabled(doc))
+        self._notify_all()
+
+    def addStatusListener(self, listener, url):
+        self.listeners.append((listener, url))
+        self._notify_listener(listener, url)
+
+    def removeStatusListener(self, listener, url):
+        self.listeners = [
+            (current_listener, current_url)
+            for current_listener, current_url in self.listeners
+            if current_listener is not listener or _url_command(current_url) != _url_command(url)
+        ]
+
+    def _notify_all(self):
+        for listener, url in list(self.listeners):
+            self._notify_listener(listener, url)
+
+    def _notify_listener(self, listener, url):
+        try:
+            event = FeatureStateEvent()
+            event.Source = self
+            event.FeatureURL = url
+            event.FeatureDescriptor = ""
+            event.IsEnabled = _url_command(url) in SUPPORTED_DISPATCH_COMMANDS and self._has_writer_document()
+            event.Requery = False
+            event.State = _uno_boolean(self._state_for_url(url))
+            listener.statusChanged(event)
+        except Exception:
+            pass
+
+    def _state_for_url(self, url):
+        command = _url_command(url)
+        runtime = _load_writer_runtime()
+        doc = self._current_writer_document(runtime)
+        if command == "toggle":
+            return bool(doc is not None and runtime.is_autocomplete_enabled(doc))
+        if command == "continuous":
+            return bool(runtime.is_continuous_suggestions_enabled())
+        return False
+
+    def _has_writer_document(self):
+        try:
+            runtime = _load_writer_runtime()
+            return self._current_writer_document(runtime) is not None
+        except Exception:
+            return False
+
+    def _current_writer_document(self, runtime):
+        for candidate in (
+            self._document_from_frame(self.frame),
+            self._document_from_desktop_frame(),
+            self._document_from_desktop_component(),
+        ):
+            if runtime._is_writer_document(candidate):
+                return candidate
+        return None
+
+    def _document_from_frame(self, frame):
+        frame = _unwrap_initialization_value(frame)
+        if frame is None:
+            return None
+        try:
+            if frame.supportsService("com.sun.star.text.TextDocument"):
+                return frame
+        except Exception:
+            pass
+        try:
+            controller = frame.getController()
+            return controller.getModel()
+        except Exception:
+            pass
+        try:
+            controller = frame.getCurrentController()
+            return controller.getModel()
+        except Exception:
+            return None
+
+    def _document_from_desktop_frame(self):
+        try:
+            desktop = self.ctx.ServiceManager.createInstanceWithContext("com.sun.star.frame.Desktop", self.ctx)
+            return self._document_from_frame(desktop.getCurrentFrame())
+        except Exception:
+            return None
+
+    def _document_from_desktop_component(self):
+        try:
+            desktop = self.ctx.ServiceManager.createInstanceWithContext("com.sun.star.frame.Desktop", self.ctx)
+            doc = desktop.getCurrentComponent()
+        except Exception:
+            return None
+        return doc
+
+    def getImplementationName(self):
+        return self.ImplementationName
+
+    def supportsService(self, service_name):
+        return service_name in self.services
+
+    def getSupportedServiceNames(self):
+        return self.services
+
+
+def _load_writer_runtime():
+    global _RUNTIME_MODULE
+    if _RUNTIME_MODULE is not None:
+        return _RUNTIME_MODULE
+
+    script_path = os.path.join(os.path.dirname(__file__), "Scripts", "python", "writer_autocomplete.py")
+    spec = importlib.util.spec_from_file_location("_librecompleteai_writer_runtime", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _RUNTIME_MODULE = module
+    return module
+
+
+def _url_command(url):
+    for attr in ("Path", "Name"):
+        try:
+            value = str(getattr(url, attr) or "").strip()
+            if value:
+                return value.lstrip("/")
+        except Exception:
+            pass
+
+    try:
+        complete = str(url.Complete)
+    except Exception:
+        complete = str(url or "")
+    if complete.startswith(DISPATCH_PROTOCOL):
+        complete = complete[len(DISPATCH_PROTOCOL) :]
+    elif ":" in complete:
+        complete = complete.split(":", 1)[1]
+    return complete.split("?", 1)[0].lstrip("/")
+
+
+def _flatten_initialization_args(args):
+    try:
+        iterator = iter(args)
+    except Exception:
+        return (args,)
+
+    flattened = []
+    for arg in iterator:
+        if isinstance(arg, (tuple, list)):
+            flattened.extend(_unwrap_initialization_value(value) for value in arg)
+        else:
+            flattened.append(_unwrap_initialization_value(arg))
+    return tuple(flattened)
+
+
+def _unwrap_initialization_value(value):
+    try:
+        if hasattr(value, "value"):
+            value = value.value
+    except Exception:
+        pass
+    try:
+        name = str(value.Name)
+        if name.lower() in ("frame", "xframe", "document", "model"):
+            return value.Value
+    except Exception:
+        pass
+    return value
+
+
+def _uno_boolean(value):
+    if uno is not None:
+        try:
+            return uno.Any("boolean", bool(value))
+        except Exception:
+            pass
+    return bool(value)
+
+
 def _set_control_text(window, name, value):
     try:
         control = window.getControl(name)
@@ -315,4 +549,9 @@ g_ImplementationHelper.addImplementation(
     LibreCompleteAIOptionsEventHandler,
     SERVICE_NAME,
     (SERVICE_NAME,),
+)
+g_ImplementationHelper.addImplementation(
+    LibreCompleteAIDispatch,
+    DISPATCH_SERVICE_NAME,
+    (DISPATCH_SERVICE_NAME, "com.sun.star.frame.ProtocolHandler"),
 )

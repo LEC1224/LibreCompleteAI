@@ -20,6 +20,11 @@ class ExtensionMetadataTests(unittest.TestCase):
             entries["Scripts/python"],
             "application/vnd.sun.star.framework-script",
         )
+        for config_file in ("ProtocolHandler.xcu", "WriterCommands.xcu", "WriterWindowState.xcu"):
+            self.assertEqual(
+                entries[config_file],
+                "application/vnd.sun.star.configuration-data",
+            )
 
     def test_addon_urls_include_installed_package_path(self):
         tree = ET.parse(ADDONS)
@@ -32,12 +37,21 @@ class ExtensionMetadataTests(unittest.TestCase):
             for value in prop.findall("value")
         ]
         self.assertTrue(values)
+        protocol_commands = set()
         for value in values:
-            self.assertTrue(
-                value.startswith("vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|"),
-                value,
-            )
-            self.assertIn("location=user:uno_packages", value)
+            if value.startswith("vnd.sun.star.script:"):
+                self.assertTrue(
+                    value.startswith("vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|"),
+                    value,
+                )
+                self.assertIn("location=user:uno_packages", value)
+            elif value.startswith("vnd.librecompleteai:"):
+                protocol_commands.add(value)
+            elif value == "private:separator":
+                continue
+            else:
+                self.fail(value)
+        self.assertTrue({"vnd.librecompleteai:toggle", "vnd.librecompleteai:continuous"} <= protocol_commands)
 
 
 if __name__ == "__main__":

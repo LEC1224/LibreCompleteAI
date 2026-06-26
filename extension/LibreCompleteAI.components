@@ -4,5 +4,9 @@
     <implementation name="org.codex.librecompleteai.OptionsEventHandler">
       <service name="org.codex.librecompleteai.OptionsEventHandler"/>
     </implementation>
+    <implementation name="org.codex.librecompleteai.Dispatch">
+      <service name="org.codex.librecompleteai.Dispatch"/>
+      <service name="com.sun.star.frame.ProtocolHandler"/>
+    </implementation>
   </component>
 </components>
