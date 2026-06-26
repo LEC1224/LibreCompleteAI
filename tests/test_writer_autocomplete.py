@@ -409,6 +409,25 @@ class WriterAutocompleteTests(unittest.TestCase):
         completion = "notebook and wrote one sentence before stopping."
         self.assertEqual(module.clean_completion(completion, prefix), " one sentence before stopping.")
 
+    def test_completion_spacing_adds_missing_space_after_word(self):
+        module = load_module()
+        self.assertEqual(
+            module._completion_with_context_spacing("We could run into", "problems"),
+            " problems",
+        )
+        self.assertEqual(
+            module._completion_with_context_spacing("We could run into", " problems"),
+            " problems",
+        )
+        self.assertEqual(
+            module._completion_with_context_spacing("We could run into", "."),
+            ".",
+        )
+        self.assertEqual(
+            module._completion_with_context_spacing("We could run into ", "problems"),
+            "problems",
+        )
+
     def test_capture_and_apply_properties(self):
         module = load_module()
 

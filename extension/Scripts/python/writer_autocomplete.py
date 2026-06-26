@@ -36,6 +36,8 @@ EXTENSION_NAME = "LibreCompleteAI"
 EXTENSION_IDENTIFIER = "org.codex.librecompleteai"
 GHOST_COLOR = 0x9AA0A6
 GHOST_PROPERTIES = ("CharColor", "CharPosture", "CharTransparence")
+NO_SPACE_BEFORE_COMPLETION_START = ".,;:!?)]}%"
+NO_SPACE_AFTER_PREFIX_END = "([{/"
 DEFAULT_SETTINGS = {
     "provider": "openai",
     "openai_api_key": "",
@@ -566,6 +568,21 @@ def _insert_completion(view_cursor, completion):
     text.insertString(view_cursor, completion, True)
 
 
+def _completion_with_context_spacing(prefix, completion):
+    if not prefix or not completion:
+        return completion
+
+    previous = prefix[-1]
+    first = completion[0]
+    if previous.isspace() or first.isspace():
+        return completion
+    if first in NO_SPACE_BEFORE_COMPLETION_START:
+        return completion
+    if previous in NO_SPACE_AFTER_PREFIX_END:
+        return completion
+    return " " + completion
+
+
 def _cursor_is_collapsed(cursor):
     try:
         return cursor.isCollapsed()
@@ -722,6 +739,7 @@ def complete_current_position(doc=None, preview=True, quiet=False):
         status.start("Generating writing autocomplete...", 0)
         view_cursor, prefix, suffix = _get_text_context(doc, settings)
         completion = request_completion(prefix, suffix, settings, key)
+        completion = _completion_with_context_spacing(prefix, completion)
         if completion:
             if preview:
                 _show_ghost_completion(doc, view_cursor, completion)
@@ -882,6 +900,7 @@ def _handle_continuous_response(doc, key, request_id, request_prefix, completion
 
     state, remaining = _reconcile_continuous_completion(request_prefix, current_prefix, completion)
     if state == "match":
+        remaining = _completion_with_context_spacing(current_prefix, remaining)
         if remaining.strip():
             _show_ghost_completion(doc, view_cursor, remaining)
         else:
