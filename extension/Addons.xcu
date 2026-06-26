@@ -8,7 +8,7 @@
     <node oor:name="AddonMenu">
       <node oor:name="org.codex.librecompleteai.settings" oor:op="replace">
         <prop oor:name="URL" oor:type="xs:string">
-          <value>vnd.sun.star.script:writer_autocomplete.py$show_settings?language=Python&amp;location=user:uno_packages</value>
+          <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$show_settings?language=Python&amp;location=user:uno_packages</value>
         </prop>
         <prop oor:name="Title" oor:type="xs:string">
           <value>LibreCompleteAI Settings...</value>
@@ -19,7 +19,7 @@
       </node>
       <node oor:name="org.codex.librecompleteai.enable" oor:op="replace">
         <prop oor:name="URL" oor:type="xs:string">
-          <value>vnd.sun.star.script:writer_autocomplete.py$enable_autocomplete?language=Python&amp;location=user:uno_packages</value>
+          <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$enable_autocomplete?language=Python&amp;location=user:uno_packages</value>
         </prop>
         <prop oor:name="Title" oor:type="xs:string">
           <value>Enable LibreCompleteAI</value>
@@ -30,7 +30,7 @@
       </node>
       <node oor:name="org.codex.librecompleteai.disable" oor:op="replace">
         <prop oor:name="URL" oor:type="xs:string">
-          <value>vnd.sun.star.script:writer_autocomplete.py$disable_autocomplete?language=Python&amp;location=user:uno_packages</value>
+          <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$disable_autocomplete?language=Python&amp;location=user:uno_packages</value>
         </prop>
         <prop oor:name="Title" oor:type="xs:string">
           <value>Disable LibreCompleteAI</value>
@@ -41,7 +41,7 @@
       </node>
       <node oor:name="org.codex.librecompleteai.complete" oor:op="replace">
         <prop oor:name="URL" oor:type="xs:string">
-          <value>vnd.sun.star.script:writer_autocomplete.py$complete_now?language=Python&amp;location=user:uno_packages</value>
+          <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$complete_now?language=Python&amp;location=user:uno_packages</value>
         </prop>
         <prop oor:name="Title" oor:type="xs:string">
           <value>LibreCompleteAI Complete Now</value>

@@ -1,13 +1,14 @@
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
 try:
     import uno
     import unohelper
-    from com.sun.star.awt import XKeyHandler
+    from com.sun.star.awt import XAdjustmentListener, XKeyHandler
     from com.sun.star.awt.FontSlant import ITALIC
     from com.sun.star.awt.Key import ESCAPE, TAB
 except Exception:
@@ -22,12 +23,16 @@ except Exception:
     class XKeyHandler(object):
         pass
 
+    class XAdjustmentListener(object):
+        pass
+
     ESCAPE = 1281
     TAB = 1282
     ITALIC = "ITALIC"
 
 
 EXTENSION_NAME = "LibreCompleteAI"
+EXTENSION_IDENTIFIER = "org.codex.librecompleteai"
 GHOST_COLOR = 0x9AA0A6
 GHOST_PROPERTIES = ("CharColor", "CharPosture", "CharTransparence")
 DEFAULT_SETTINGS = {
@@ -39,6 +44,9 @@ DEFAULT_SETTINGS = {
     "ollama_model": "llama3.2",
     "temperature": "0.45",
     "max_tokens": "96",
+    "prediction_words": "24",
+    "continuous_suggestions": "false",
+    "max_context_words": "600",
     "prefix_chars": "2400",
     "suffix_chars": "600",
     "writing_guidance": "Match the author's language, tone, point of view, and pacing.",
@@ -52,9 +60,53 @@ Prefer a concise continuation: a phrase, clause, sentence, or short paragraph.
 Preserve the author's language, tone, tense, person, and formatting conventions.
 If no helpful continuation is possible, return an empty string."""
 
+SUMMARY_PROMPT = """You compress prose context for an inline writing autocomplete engine.
+Preserve the facts, names, chronology, unresolved questions, tone, language, and point of view.
+Do not continue the story or document.
+Return only a compact summary of the provided earlier context."""
+
 _HANDLERS = {}
 _BUSY_DOCS = set()
 _GHOSTS = {}
+_CONTEXT_SUMMARIES = {}
+_LAST_AUTO_REQUEST = {}
+_DIALOG_LISTENERS = {}
+CONTINUOUS_MIN_INTERVAL_SECONDS = 1.5
+SUMMARY_REFRESH_WORDS = 120
+SUMMARY_RECENT_MIN_WORDS = 80
+SUMMARY_RECENT_RATIO = 0.5
+MAX_CONTEXT_CHAR_CAP = 80000
+SETTINGS_FIELDS = (
+    "provider",
+    "openai_api_key",
+    "openai_base_url",
+    "openai_model",
+    "ollama_host",
+    "ollama_model",
+    "temperature",
+    "max_tokens",
+    "prediction_words",
+    "continuous_suggestions",
+    "max_context_words",
+    "prefix_chars",
+    "suffix_chars",
+    "writing_guidance",
+)
+BOOLEAN_SETTINGS = ("continuous_suggestions",)
+SLIDER_SETTINGS = {
+    "max_context_words": {
+        "slider": "max_context_words_slider",
+        "minimum": 100,
+        "maximum": 4000,
+        "step": 100,
+    },
+    "prediction_words": {
+        "slider": "prediction_words_slider",
+        "minimum": 3,
+        "maximum": 120,
+        "step": 1,
+    },
+}
 
 
 def _config_dir():
@@ -80,22 +132,8 @@ def normalize_settings(settings):
         provider = "openai"
     merged["provider"] = provider
 
-    for key in (
-        "openai_api_key",
-        "openai_base_url",
-        "openai_model",
-        "ollama_host",
-        "ollama_model",
-        "temperature",
-        "max_tokens",
-        "prefix_chars",
-        "suffix_chars",
-        "writing_guidance",
-    ):
+    for key in SETTINGS_FIELDS:
         merged[key] = str(merged.get(key, DEFAULT_SETTINGS[key])).strip()
-
-    if not merged["openai_api_key"]:
-        merged["openai_api_key"] = os.environ.get("OPENAI_API_KEY", "")
 
     return merged
 
@@ -136,8 +174,27 @@ def _float_setting(settings, key):
     return max(0.0, min(2.0, value))
 
 
+def _bool_setting(settings, key):
+    value = str(settings.get(key, DEFAULT_SETTINGS.get(key, ""))).strip().lower()
+    return value in ("1", "true", "yes", "on", "enabled")
+
+
+def _prediction_words(settings):
+    return max(1, _int_setting(settings, "prediction_words"))
+
+
+def _completion_token_limit(settings):
+    token_cap = _int_setting(settings, "max_tokens")
+    return max(8, token_cap)
+
+
+def _summary_token_limit(settings):
+    max_context_words = max(100, _int_setting(settings, "max_context_words"))
+    return max(96, min(512, max_context_words // 2))
+
+
 def build_messages(prefix, suffix, settings):
-    max_words = max(12, _int_setting(settings, "max_tokens"))
+    max_words = _prediction_words(settings)
     guidance = settings.get("writing_guidance") or DEFAULT_SETTINGS["writing_guidance"]
     user_prompt = (
         "Continue the document at <cursor>.\n\n"
@@ -151,10 +208,29 @@ def build_messages(prefix, suffix, settings):
         "<after>\n"
         f"{suffix}\n"
         "</after>\n\n"
-        f"Return only the text to insert at <cursor>. Keep it under about {max_words} words."
+        f"Return only the text to insert at <cursor>. Aim for {max_words} words or fewer."
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def build_summary_messages(text, settings):
+    guidance = settings.get("writing_guidance") or DEFAULT_SETTINGS["writing_guidance"]
+    target_words = max(40, min(180, _int_setting(settings, "max_context_words") // 4))
+    user_prompt = (
+        "Summarize this earlier document context for later inline autocomplete.\n\n"
+        "Writing guidance:\n"
+        f"{guidance}\n\n"
+        "Earlier context:\n"
+        "<context>\n"
+        f"{text}\n"
+        "</context>\n\n"
+        f"Keep the summary under about {target_words} words."
+    )
+    return [
+        {"role": "system", "content": SUMMARY_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -194,16 +270,26 @@ def _remove_prefix_echo(prefix, completion):
     return completion
 
 
-def request_completion(prefix, suffix, settings):
+def request_completion(prefix, suffix, settings, cache_key=None):
     settings = normalize_settings(settings)
+    prefix = _compress_context_if_needed(prefix, settings, cache_key)
+    messages = build_messages(prefix, suffix, settings)
     if settings["provider"] == "ollama":
-        raw = _request_ollama(prefix, suffix, settings)
+        raw = _request_ollama_messages(messages, settings, _completion_token_limit(settings))
     else:
-        raw = _request_openai(prefix, suffix, settings)
+        raw = _request_openai_messages(messages, settings, _completion_token_limit(settings))
     return clean_completion(raw, prefix)
 
 
 def _request_openai(prefix, suffix, settings):
+    return _request_openai_messages(
+        build_messages(prefix, suffix, settings),
+        settings,
+        _completion_token_limit(settings),
+    )
+
+
+def _request_openai_messages(messages, settings, token_limit=None, temperature=None):
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         raise RuntimeError("OpenAI provider is selected, but no API key is configured.")
@@ -215,15 +301,23 @@ def _request_openai(prefix, suffix, settings):
     base_url = (settings.get("openai_base_url") or DEFAULT_SETTINGS["openai_base_url"]).rstrip("/")
     payload = {
         "model": model,
-        "messages": build_messages(prefix, suffix, settings),
-        "temperature": _float_setting(settings, "temperature"),
-        "max_tokens": _int_setting(settings, "max_tokens"),
+        "messages": messages,
+        "temperature": _float_setting(settings, "temperature") if temperature is None else temperature,
+        "max_completion_tokens": token_limit or _completion_token_limit(settings),
     }
     headers = {
         "Authorization": "Bearer " + api_key,
         "Content-Type": "application/json",
     }
-    response = _post_json(base_url + "/chat/completions", payload, headers)
+    url = base_url + "/chat/completions"
+    try:
+        response = _post_json(url, payload, headers)
+    except _HttpJsonError as exc:
+        if not _is_unsupported_parameter(exc, "max_completion_tokens"):
+            raise
+        fallback_payload = dict(payload)
+        fallback_payload["max_tokens"] = fallback_payload.pop("max_completion_tokens")
+        response = _post_json(url, fallback_payload, headers)
     try:
         return response["choices"][0]["message"]["content"]
     except Exception:
@@ -231,6 +325,14 @@ def _request_openai(prefix, suffix, settings):
 
 
 def _request_ollama(prefix, suffix, settings):
+    return _request_ollama_messages(
+        build_messages(prefix, suffix, settings),
+        settings,
+        _completion_token_limit(settings),
+    )
+
+
+def _request_ollama_messages(messages, settings, token_limit=None, temperature=None):
     model = settings.get("ollama_model")
     if not model:
         raise RuntimeError("Ollama provider is selected, but no model label is configured.")
@@ -238,11 +340,11 @@ def _request_ollama(prefix, suffix, settings):
     host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
     payload = {
         "model": model,
-        "messages": build_messages(prefix, suffix, settings),
+        "messages": messages,
         "stream": False,
         "options": {
-            "temperature": _float_setting(settings, "temperature"),
-            "num_predict": _int_setting(settings, "max_tokens"),
+            "temperature": _float_setting(settings, "temperature") if temperature is None else temperature,
+            "num_predict": token_limit or _completion_token_limit(settings),
         },
     }
     response = _post_json(host + "/api/chat", payload, {"Content-Type": "application/json"})
@@ -250,6 +352,107 @@ def _request_ollama(prefix, suffix, settings):
         return response["message"]["content"]
     except Exception:
         raise RuntimeError("Ollama response did not include a chat message.")
+
+
+def _compress_context_if_needed(prefix, settings, cache_key=None):
+    max_words = _int_setting(settings, "max_context_words")
+    if max_words <= 0 or _word_count(prefix) <= max_words:
+        return prefix
+
+    recent_words = max(SUMMARY_RECENT_MIN_WORDS, int(max_words * SUMMARY_RECENT_RATIO))
+    older, recent = _split_recent_words(prefix, recent_words)
+    if not older:
+        return _last_words(prefix, max_words)
+
+    try:
+        summary = _summarize_context(older, settings, cache_key)
+    except Exception:
+        return _last_words(prefix, max_words)
+
+    if not summary:
+        return _last_words(prefix, max_words)
+
+    return (
+        "[Compressed earlier context]\n"
+        f"{summary.strip()}\n\n"
+        "[Recent text before cursor]\n"
+        f"{recent.strip()}"
+    )
+
+
+def _summarize_context(text, settings, cache_key=None):
+    text = text.strip()
+    if not text:
+        return ""
+
+    if cache_key is not None:
+        cached = _CONTEXT_SUMMARIES.get(cache_key)
+        if cached and text.startswith(cached["source"]):
+            extra_words = _word_count(text) - cached["source_words"]
+            if extra_words <= SUMMARY_REFRESH_WORDS:
+                carryover = text[len(cached["source"]) :].strip()
+                if carryover:
+                    return cached["summary"] + "\nRecent unsummarized context: " + carryover
+                return cached["summary"]
+
+    messages = build_summary_messages(text, settings)
+    if settings["provider"] == "ollama":
+        raw = _request_ollama_messages(messages, settings, _summary_token_limit(settings), temperature=0.2)
+    else:
+        raw = _request_openai_messages(messages, settings, _summary_token_limit(settings), temperature=0.2)
+    summary = clean_completion(raw)
+
+    if cache_key is not None:
+        _CONTEXT_SUMMARIES[cache_key] = {
+            "source": text,
+            "source_words": _word_count(text),
+            "summary": summary,
+        }
+    return summary
+
+
+def _word_count(text):
+    return len(re.findall(r"\S+", text or ""))
+
+
+def _split_recent_words(text, recent_words):
+    matches = list(re.finditer(r"\S+", text or ""))
+    if len(matches) <= recent_words:
+        return "", text
+    split_at = matches[-recent_words].start()
+    return text[:split_at].rstrip(), text[split_at:].lstrip()
+
+
+def _last_words(text, count):
+    matches = list(re.finditer(r"\S+", text or ""))
+    if len(matches) <= count:
+        return text
+    return text[matches[-count].start() :].lstrip()
+
+
+class _HttpJsonError(RuntimeError):
+    def __init__(self, code, url, body):
+        self.code = code
+        self.url = url
+        self.body = body
+        RuntimeError.__init__(self, f"HTTP {code} from {url}: {body[:1000]}")
+
+
+def _is_unsupported_parameter(error, parameter):
+    if error.code != 400:
+        return False
+    try:
+        body = json.loads(error.body)
+        api_error = body.get("error", {})
+        return (
+            api_error.get("code") == "unsupported_parameter"
+            and api_error.get("param") == parameter
+        )
+    except Exception:
+        return (
+            "Unsupported parameter" in error.body
+            and parameter in error.body
+        )
 
 
 def _post_json(url, payload, headers=None, timeout=90):
@@ -260,7 +463,7 @@ def _post_json(url, payload, headers=None, timeout=90):
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {body[:1000]}")
+        raise _HttpJsonError(exc.code, url, body)
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach {url}: {exc.reason}")
 
@@ -320,7 +523,7 @@ def _get_text_context(doc, settings):
     text = view_cursor.getText()
 
     prefix_cursor = text.createTextCursorByRange(view_cursor.getStart())
-    prefix_cursor.goLeft(_int_setting(settings, "prefix_chars"), True)
+    prefix_cursor.goLeft(_prefix_char_budget(settings), True)
     prefix = prefix_cursor.getString()
 
     suffix_cursor = text.createTextCursorByRange(view_cursor.getEnd())
@@ -328,6 +531,13 @@ def _get_text_context(doc, settings):
     suffix = suffix_cursor.getString()
 
     return view_cursor, prefix, suffix
+
+
+def _prefix_char_budget(settings):
+    legacy_chars = _int_setting(settings, "prefix_chars")
+    context_words = _int_setting(settings, "max_context_words")
+    word_budget_chars = context_words * 8 if context_words else legacy_chars
+    return max(legacy_chars, min(MAX_CONTEXT_CHAR_CAP, word_budget_chars))
 
 
 def _insert_completion(view_cursor, completion):
@@ -361,7 +571,9 @@ class GhostCompletion:
     def accept(self):
         if self.matches_document():
             _apply_properties(self.text_range, self.original_properties)
-            _move_view_cursor_to_range(self.doc, self.text_range.getEnd())
+            end = self.text_range.getEnd()
+            _move_view_cursor_to_range(self.doc, end)
+            _restore_insertion_properties(self.doc, end, self.original_properties)
 
     def discard(self):
         if not self.matches_document():
@@ -370,6 +582,7 @@ class GhostCompletion:
         start = self.text_range.getStart()
         self.text_range.setString("")
         _move_view_cursor_to_range(self.doc, start)
+        _restore_insertion_properties(self.doc, start, self.original_properties)
 
 
 def _has_ghost(doc):
@@ -425,6 +638,14 @@ def _apply_properties(text_range, values):
             pass
 
 
+def _restore_insertion_properties(doc, text_range, values):
+    _apply_properties(text_range, values)
+    try:
+        _apply_properties(_view_cursor(doc), values)
+    except Exception:
+        pass
+
+
 def _apply_ghost_style(text_range):
     try:
         text_range.CharColor = GHOST_COLOR
@@ -458,10 +679,11 @@ def _go_left(cursor, count, expand):
     return True
 
 
-def complete_current_position(doc=None, preview=True):
+def complete_current_position(doc=None, preview=True, quiet=False):
     doc = doc or _current_document()
     if not _is_writer_document(doc):
-        _message_box(doc, EXTENSION_NAME, "Open a Writer document before using autocomplete.")
+        if not quiet:
+            _message_box(doc, EXTENSION_NAME, "Open a Writer document before using autocomplete.")
         return
 
     if _has_ghost(doc):
@@ -478,16 +700,18 @@ def complete_current_position(doc=None, preview=True):
     try:
         status.start("Generating writing autocomplete...", 0)
         view_cursor, prefix, suffix = _get_text_context(doc, settings)
-        completion = request_completion(prefix, suffix, settings)
+        completion = request_completion(prefix, suffix, settings, key)
         if completion:
             if preview:
                 _show_ghost_completion(doc, view_cursor, completion)
             else:
                 _insert_completion(view_cursor, completion)
         else:
-            _message_box(doc, EXTENSION_NAME, "The model did not return a useful continuation.")
+            if not quiet:
+                _message_box(doc, EXTENSION_NAME, "The model did not return a useful continuation.")
     except Exception as exc:
-        _message_box(doc, EXTENSION_NAME, str(exc))
+        if not quiet:
+            _message_box(doc, EXTENSION_NAME, str(exc))
     finally:
         try:
             status.end()
@@ -524,10 +748,43 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
         return False
 
     def keyReleased(self, event):
+        try:
+            if _has_ghost(self.doc):
+                return False
+            settings = load_settings()
+            if not _bool_setting(settings, "continuous_suggestions"):
+                return False
+            if not _is_continuous_trigger(event):
+                return False
+
+            key = _doc_key(self.doc)
+            now = time.time()
+            if now - _LAST_AUTO_REQUEST.get(key, 0) < CONTINUOUS_MIN_INTERVAL_SECONDS:
+                return False
+
+            _LAST_AUTO_REQUEST[key] = now
+            complete_current_position(self.doc, preview=True, quiet=True)
+        except Exception:
+            return False
         return False
 
     def disposing(self, event):
         self.doc = None
+
+
+def _is_continuous_trigger(event):
+    if getattr(event, "Modifiers", 0) != 0:
+        return False
+    key_code = getattr(event, "KeyCode", None)
+    if key_code in (TAB, ESCAPE):
+        return False
+
+    char = str(getattr(event, "KeyChar", "") or "")
+    if not char:
+        return False
+    if char.isspace():
+        return True
+    return char in ".?!,:;)]}\"'"
 
 
 def enable_autocomplete(*args):
@@ -590,6 +847,7 @@ def show_settings(*args):
             save_settings(updated)
             _message_box(doc, EXTENSION_NAME, "Settings saved.")
     finally:
+        _DIALOG_LISTENERS.pop(id(dialog), None)
         dialog.dispose()
 
 
@@ -598,66 +856,85 @@ def _create_settings_dialog(ctx, settings):
     model = smgr.createInstanceWithContext("com.sun.star.awt.UnoControlDialogModel", ctx)
     model.PositionX = 80
     model.PositionY = 80
-    model.Width = 250
-    model.Height = 245
+    model.Width = 285
+    model.Height = 312
     model.Title = "LibreCompleteAI Settings"
 
     y = 10
     _label(model, "provider_label", 10, y, 70, "Provider")
-    provider = _control(model, "com.sun.star.awt.UnoControlListBoxModel", "provider", 88, y - 2, 145, 14)
+    provider = _control(model, "com.sun.star.awt.UnoControlListBoxModel", "provider", 88, y - 2, 175, 14)
     provider.Dropdown = True
     provider.StringItemList = ("OpenAI", "Ollama")
     provider.SelectedItems = (0 if settings["provider"] == "openai" else 1,)
 
     y += 22
     _label(model, "api_key_label", 10, y, 70, "OpenAI key")
-    api_key = _edit(model, "openai_api_key", 88, y - 2, 145, settings.get("openai_api_key", ""))
+    api_key = _edit(model, "openai_api_key", 88, y - 2, 175, settings.get("openai_api_key", ""))
     api_key.EchoChar = 42
 
     y += 18
     _label(model, "base_url_label", 10, y, 70, "OpenAI base URL")
-    _edit(model, "openai_base_url", 88, y - 2, 145, settings.get("openai_base_url", ""))
+    _edit(model, "openai_base_url", 88, y - 2, 175, settings.get("openai_base_url", ""))
 
     y += 18
     _label(model, "openai_model_label", 10, y, 70, "OpenAI model")
-    _edit(model, "openai_model", 88, y - 2, 145, settings.get("openai_model", ""))
+    _edit(model, "openai_model", 88, y - 2, 175, settings.get("openai_model", ""))
 
     y += 22
     _label(model, "ollama_host_label", 10, y, 70, "Ollama host")
-    _edit(model, "ollama_host", 88, y - 2, 145, settings.get("ollama_host", ""))
+    _edit(model, "ollama_host", 88, y - 2, 175, settings.get("ollama_host", ""))
 
     y += 18
     _label(model, "ollama_model_label", 10, y, 70, "Ollama model")
-    _edit(model, "ollama_model", 88, y - 2, 145, settings.get("ollama_model", ""))
+    _edit(model, "ollama_model", 88, y - 2, 175, settings.get("ollama_model", ""))
 
     y += 22
+    _checkbox(
+        model,
+        "continuous_suggestions",
+        10,
+        y - 1,
+        235,
+        "Continuous autocomplete suggestions",
+        _bool_setting(settings, "continuous_suggestions"),
+    )
+
+    y += 20
     _label(model, "temperature_label", 10, y, 70, "Temperature")
     _edit(model, "temperature", 88, y - 2, 45, settings.get("temperature", ""))
 
-    _label(model, "max_tokens_label", 143, y, 42, "Max tokens")
-    _edit(model, "max_tokens", 188, y - 2, 45, settings.get("max_tokens", ""))
+    _label(model, "max_tokens_label", 155, y, 55, "Token cap")
+    _edit(model, "max_tokens", 218, y - 2, 45, settings.get("max_tokens", ""))
 
     y += 18
-    _label(model, "prefix_label", 10, y, 70, "Before chars")
-    _edit(model, "prefix_chars", 88, y - 2, 45, settings.get("prefix_chars", ""))
+    _label(model, "context_label", 10, y, 70, "Context words")
+    _edit(model, "max_context_words", 88, y - 2, 45, settings.get("max_context_words", ""))
+    _slider(model, "max_context_words_slider", 143, y - 1, 120, settings, "max_context_words")
 
-    _label(model, "suffix_label", 143, y, 42, "After chars")
-    _edit(model, "suffix_chars", 188, y - 2, 45, settings.get("suffix_chars", ""))
+    y += 18
+    _label(model, "prediction_label", 10, y, 70, "Prediction words")
+    _edit(model, "prediction_words", 88, y - 2, 45, settings.get("prediction_words", ""))
+    _slider(model, "prediction_words_slider", 143, y - 1, 120, settings, "prediction_words")
 
-    y += 22
+    y += 18
+    _label(model, "suffix_label", 10, y, 70, "After chars")
+    _edit(model, "suffix_chars", 88, y - 2, 45, settings.get("suffix_chars", ""))
+
+    y += 20
     _label(model, "guidance_label", 10, y, 70, "Writing guidance")
-    guidance = _edit(model, "writing_guidance", 88, y - 2, 145, settings.get("writing_guidance", ""))
+    guidance = _edit(model, "writing_guidance", 88, y - 2, 175, settings.get("writing_guidance", ""))
     guidance.Height = 34
     guidance.MultiLine = True
     guidance.VScroll = True
 
-    _button(model, "ok", 138, 220, 45, "OK", 1)
-    _button(model, "cancel", 188, 220, 45, "Cancel", 2)
+    _button(model, "ok", 168, 288, 45, "OK", 1)
+    _button(model, "cancel", 218, 288, 45, "Cancel", 2)
 
     dialog = smgr.createInstanceWithContext("com.sun.star.awt.UnoControlDialog", ctx)
     dialog.setModel(model)
     toolkit = smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", ctx)
     dialog.createPeer(toolkit, None)
+    _DIALOG_LISTENERS[id(dialog)] = _connect_slider_listeners(dialog)
     return dialog
 
 
@@ -666,19 +943,13 @@ def _settings_from_dialog(dialog, current):
     provider = provider_control.getSelectedItem().lower()
     updated = dict(current)
     updated["provider"] = provider
-    for name in (
-        "openai_api_key",
-        "openai_base_url",
-        "openai_model",
-        "ollama_host",
-        "ollama_model",
-        "temperature",
-        "max_tokens",
-        "prefix_chars",
-        "suffix_chars",
-        "writing_guidance",
-    ):
-        updated[name] = dialog.getControl(name).getText()
+    for name in SETTINGS_FIELDS:
+        if name == "provider":
+            continue
+        if name in BOOLEAN_SETTINGS:
+            updated[name] = _get_dialog_bool(dialog, name, current.get(name, "false"))
+        else:
+            updated[name] = _get_dialog_text(dialog, name, current.get(name, DEFAULT_SETTINGS.get(name, "")))
     return normalize_settings(updated)
 
 
@@ -704,11 +975,145 @@ def _edit(model, name, x, y, width, text):
     return edit
 
 
+def _checkbox(model, name, x, y, width, text, checked):
+    checkbox = _control(model, "com.sun.star.awt.UnoControlCheckBoxModel", name, x, y, width, 12)
+    checkbox.Label = text
+    checkbox.State = 1 if checked else 0
+    return checkbox
+
+
+def _slider(model, name, x, y, width, settings, setting_name):
+    slider = _control(model, "com.sun.star.awt.UnoControlScrollBarModel", name, x, y, width, 10)
+    config = SLIDER_SETTINGS[setting_name]
+    value = _clamp(_int_setting(settings, setting_name), config["minimum"], config["maximum"])
+    for prop, prop_value in (
+        ("Orientation", 0),
+        ("ScrollValueMin", config["minimum"]),
+        ("ScrollValueMax", config["maximum"]),
+        ("ScrollValue", value),
+        ("LineIncrement", config["step"]),
+        ("BlockIncrement", config["step"] * 5),
+        ("VisibleSize", config["step"]),
+        ("LiveScroll", True),
+    ):
+        try:
+            setattr(slider, prop, prop_value)
+        except Exception:
+            pass
+    return slider
+
+
 def _button(model, name, x, y, width, text, button_type):
     button = _control(model, "com.sun.star.awt.UnoControlButtonModel", name, x, y, width, 14)
     button.Label = text
     button.PushButtonType = button_type
     return button
+
+
+def _get_dialog_text(dialog, name, default=""):
+    try:
+        control = dialog.getControl(name)
+    except Exception:
+        return default
+    return _control_text(control, default)
+
+
+def _get_dialog_bool(dialog, name, default="false"):
+    try:
+        control = dialog.getControl(name)
+    except Exception:
+        return default
+    return "true" if _control_state(control, default) else "false"
+
+
+def _control_text(control, default=""):
+    for getter in (
+        lambda: control.getText(),
+        lambda: control.Text,
+        lambda: control.getModel().Text,
+        lambda: control.Value,
+        lambda: control.getModel().Value,
+        lambda: control.getModel().ScrollValue,
+    ):
+        try:
+            return str(getter())
+        except Exception:
+            pass
+    return default
+
+
+def _set_control_text(control, value):
+    value = str(value)
+    for setter in (
+        lambda: control.setText(value),
+        lambda: setattr(control, "Text", value),
+        lambda: setattr(control.getModel(), "Text", value),
+        lambda: setattr(control.getModel(), "Value", int(float(value))),
+    ):
+        try:
+            setter()
+            return
+        except Exception:
+            pass
+
+
+def _control_state(control, default=False):
+    if isinstance(default, str):
+        default = default.strip().lower() in ("1", "true", "yes", "on", "enabled")
+    for getter in (
+        lambda: control.getState(),
+        lambda: control.State,
+        lambda: control.getModel().State,
+    ):
+        try:
+            return int(getter()) != 0
+        except Exception:
+            pass
+    return bool(default)
+
+
+def _connect_slider_listeners(dialog):
+    listeners = []
+    for setting_name, config in SLIDER_SETTINGS.items():
+        try:
+            slider = dialog.getControl(config["slider"])
+            target = dialog.getControl(setting_name)
+            listener = _SliderToTextListener(target)
+            slider.addAdjustmentListener(listener)
+            listeners.append(listener)
+        except Exception:
+            pass
+    return listeners
+
+
+class _SliderToTextListener(unohelper.Base, XAdjustmentListener):
+    def __init__(self, target):
+        self.target = target
+
+    def adjustmentValueChanged(self, event):
+        value = _slider_event_value(event)
+        if value is not None and self.target is not None:
+            _set_control_text(self.target, str(int(value)))
+
+    def disposing(self, event):
+        self.target = None
+
+
+def _slider_event_value(event):
+    for getter in (
+        lambda: event.Value,
+        lambda: event.Source.getValue(),
+        lambda: event.Source.getModel().ScrollValue,
+    ):
+        try:
+            return getter()
+        except Exception:
+            pass
+    return None
+
+
+def _clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, int(value)))
 
 
 def _status_indicator(doc):

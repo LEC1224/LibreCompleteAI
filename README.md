@@ -1,5 +1,11 @@
 # LibreCompleteAI
 
+![LibreCompleteAI ghost-text autocomplete in LibreOffice Writer](assets/librecompleteai-ghost-text-preview.png)
+
+Bring Cursor-style AI autocomplete to LibreOffice Writer. LibreCompleteAI helps you stay in the flow by suggesting natural prose continuations directly at the cursor, previewed as subtle ghost text you can accept with Tab or ignore by simply continuing to write.
+
+It is built for drafting, editing, and long-form writing: essays, articles, fiction, reports, notes, and any document where the next sentence matters more than the next line of code. Use OpenAI-compatible models with your own API key, or keep everything local with Ollama.
+
 LibreCompleteAI is a LibreOffice Writer extension that uses an LLM to continue prose at the cursor when you press Tab. It is aimed at drafting, editing, and long-form writing rather than code completion.
 
 It is intended for LibreOffice 7.0 or newer.
@@ -11,6 +17,9 @@ It is intended for LibreOffice 7.0 or newer.
 - A LibreOffice settings dialog for provider and generation options.
 - A fallback "Complete Now" menu command if you want to test completion without enabling the Tab hook.
 - A ghost-text style preview: press Tab once to preview, press Tab again to accept.
+- Optional continuous suggestions after natural writing pauses.
+- Context compression for long documents, using the same selected LLM.
+- Tunable context length and prediction length controls.
 
 ## Build From Source
 
@@ -36,6 +45,8 @@ Tools > Extension Manager > Add...
 
 Choose `dist/LibreCompleteAI.oxt`, install it for the current user, and restart LibreOffice.
 
+LibreCompleteAI's Add-ons menu commands are packaged for current-user installation. If an older test build is already installed, remove it from Extension Manager first, restart LibreOffice, then install the new `.oxt`.
+
 You can also install from the command line on Windows:
 
 ```powershell
@@ -50,12 +61,18 @@ In Writer, open:
 Tools > Add-ons > LibreCompleteAI Settings...
 ```
 
+You can also select LibreCompleteAI in the Extension Manager and click `Options`, or open LibreOffice's normal Options dialog and choose:
+
+```text
+LibreCompleteAI > Settings
+```
+
 For OpenAI-compatible use, set:
 
 - Provider: `OpenAI`
 - API key
 - Base URL, usually `https://api.openai.com/v1`
-- Model label, for example `gpt-4.1-mini` or another model available to your account
+- Model label, for example `gpt-5.4-mini`, `gpt-4.1-mini`, or another model available to your account
 
 For Ollama use, set:
 
@@ -63,7 +80,16 @@ For Ollama use, set:
 - Host, usually `http://localhost:11434`
 - Model label, matching a local model from `ollama list`
 
+Generation controls:
+
+- `Continuous autocomplete suggestions`: request suggestions automatically after natural writing boundaries such as spaces and punctuation. Leave it off to only request completions with Tab.
+- `Context words`: how many words before the cursor should guide suggestions. Older text is compressed with the selected LLM when the context grows beyond this budget.
+- `Prediction words`: a soft guideline for how long each suggestion should be.
+- `Token cap`: the hard output token limit sent to OpenAI-compatible APIs or Ollama.
+
 API keys are stored locally in plain text in the user's configuration directory.
+
+If the API key field is left empty, LibreCompleteAI can still use an `OPENAI_API_KEY` environment variable at completion time. Environment keys are not displayed or saved by the settings UI.
 
 ## Use
 

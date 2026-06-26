@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<oor:component-data
+  xmlns:oor="http://openoffice.org/2001/registry"
+  xmlns:xs="http://www.w3.org/2001/XMLSchema"
+  oor:name="OptionsDialog"
+  oor:package="org.openoffice.Office">
+  <node oor:name="Nodes">
+    <node oor:name="org.codex.librecompleteai.OptionsNode" oor:op="fuse">
+      <prop oor:name="Label">
+        <value xml:lang="en-US">LibreCompleteAI</value>
+      </prop>
+      <prop oor:name="AllModules">
+        <value>true</value>
+      </prop>
+      <node oor:name="Leaves">
+        <node oor:name="org.codex.librecompleteai.Settings" oor:op="fuse">
+          <prop oor:name="Id">
+            <value>org.codex.librecompleteai</value>
+          </prop>
+          <prop oor:name="Label">
+            <value xml:lang="en-US">Settings</value>
+          </prop>
+          <prop oor:name="OptionsPage">
+            <value>%origin%/options/LibreCompleteAI.xdl</value>
+          </prop>
+          <prop oor:name="EventHandlerService">
+            <value>org.codex.librecompleteai.OptionsEventHandler</value>
+          </prop>
+        </node>
+      </node>
+    </node>
+  </node>
+</oor:component-data>
