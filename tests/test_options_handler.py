@@ -85,6 +85,39 @@ class OptionsHandlerTests(unittest.TestCase):
         module._set_control_bool(window, "continuous_suggestions", "false")
         self.assertEqual(module._get_control_bool(window, "continuous_suggestions"), "false")
 
+    def test_secondary_toolbar_commands_follow_main_toggle_state(self):
+        module = load_module()
+        dispatch = module.LibreCompleteAIDispatch(ctx=None)
+
+        class Url:
+            Complete = "vnd.librecompleteai:continuous"
+
+        class Listener:
+            def __init__(self):
+                self.events = []
+
+            def statusChanged(self, event):
+                self.events.append(event)
+
+        listener = Listener()
+        dispatch._has_writer_document = lambda: True
+        dispatch._state_for_url = lambda url: True
+
+        dispatch._is_autocomplete_enabled = lambda: False
+        dispatch._notify_listener(listener, Url())
+        self.assertEqual(len(listener.events), 1)
+        self.assertFalse(listener.events[0].IsEnabled)
+        self.assertFalse(listener.events[0].State.bVisible)
+
+        listener.events = []
+        dispatch._is_autocomplete_enabled = lambda: True
+        dispatch._notify_listener(listener, Url())
+        self.assertEqual(len(listener.events), 2)
+        self.assertTrue(listener.events[0].IsEnabled)
+        self.assertTrue(listener.events[0].State.bVisible)
+        self.assertTrue(listener.events[1].IsEnabled)
+        self.assertTrue(listener.events[1].State)
+
 
 if __name__ == "__main__":
     unittest.main()

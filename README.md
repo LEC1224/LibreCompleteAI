@@ -15,7 +15,7 @@ It is intended for LibreOffice 7.0 or newer.
 - OpenAI-compatible chat completions with an API key, base URL, and model label.
 - Ollama at a local or remote host, using any model you have downloaded.
 - A LibreOffice settings dialog for provider and generation options.
-- Toolbar buttons for toggling LibreCompleteAI, toggling continuous suggestions, completing now, and opening settings.
+- A compact `LC-AI` Writer toolbar with short text buttons for toggling LC-AI, continuous suggestions, completion, and settings.
 - A fallback "Complete Now" command if you want to test completion without enabling the Tab hook.
 - A ghost-text style preview: press Tab once to preview, press Tab again to accept.
 - Optional continuous suggestions after natural writing pauses.
@@ -59,7 +59,7 @@ You can also install from the command line on Windows:
 In Writer, open:
 
 ```text
-Tools > Add-ons > LibreCompleteAI Settings...
+Tools > Add-ons > LC-AI Settings...
 ```
 
 You can also select LibreCompleteAI in the Extension Manager and click `Options`, or open LibreOffice's normal Options dialog and choose:
@@ -94,21 +94,21 @@ If the API key field is left empty, LibreCompleteAI can still use an `OPENAI_API
 
 ## Use
 
-In Writer, use the `LibreCompleteAI On/Off` icon on the standard toolbar, or choose:
+In Writer, use the `LC-AI` button on the LibreCompleteAI toolbar, or choose:
 
 ```text
 Tools > Add-ons > Toggle LibreCompleteAI
 ```
 
-The toolbar icon stays pressed while LibreCompleteAI is enabled for the current Writer window. Then press Tab while the cursor is in document text. The extension sends a small amount of text before and after the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
+The `LC-AI` button stays pressed while LibreCompleteAI is enabled for the current Writer window. The secondary toolbar buttons are available only while LC-AI is enabled. Then press Tab while the cursor is in document text. The extension sends a small amount of text before and after the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
 
-For automatic background suggestions, use the `Continuous Suggestions On/Off` toolbar button, or choose:
+For automatic background suggestions, use the `Continuous` toolbar button, or choose:
 
 ```text
 Tools > Add-ons > Toggle Continuous Suggestions
 ```
 
-The `Complete Now` toolbar icon asks for one suggestion immediately. Hover over any LibreCompleteAI icon to see the full command name.
+The `Complete` toolbar button asks for one suggestion immediately. `Settings` opens the LC-AI settings dialog.
 
 When a preview is visible:
 
@@ -118,7 +118,7 @@ When a preview is visible:
 
 While enabled, plain Tab is consumed by the extension. Toggle LibreCompleteAI off to restore Writer's normal Tab behavior.
 
-The icons are added to the right side of Writer's standard toolbar. If they do not appear after upgrading, restart LibreOffice once after reinstalling the `.oxt`.
+The compact text toolbar is docked near the top of Writer. If it does not refresh after upgrading, restart LibreOffice once after reinstalling the `.oxt`.
 
 ## Notes
 

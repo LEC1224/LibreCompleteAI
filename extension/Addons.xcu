@@ -8,10 +8,10 @@
     <node oor:name="AddonMenu">
       <node oor:name="org.codex.librecompleteai.settings" oor:op="replace">
         <prop oor:name="URL" oor:type="xs:string">
-          <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$show_settings?language=Python&amp;location=user:uno_packages</value>
+          <value>vnd.librecompleteai:settings</value>
         </prop>
         <prop oor:name="Title" oor:type="xs:string">
-          <value>LibreCompleteAI Settings...</value>
+          <value>LC-AI Settings...</value>
         </prop>
         <prop oor:name="Target" oor:type="xs:string">
           <value>_self</value>
@@ -22,7 +22,7 @@
           <value>vnd.librecompleteai:toggle</value>
         </prop>
         <prop oor:name="Title" oor:type="xs:string">
-          <value>Toggle LibreCompleteAI</value>
+          <value>Toggle LC-AI</value>
         </prop>
         <prop oor:name="Target" oor:type="xs:string">
           <value>_self</value>
@@ -44,7 +44,7 @@
           <value>vnd.librecompleteai:complete</value>
         </prop>
         <prop oor:name="Title" oor:type="xs:string">
-          <value>LibreCompleteAI Complete Now</value>
+          <value>LC-AI Complete Now</value>
         </prop>
         <prop oor:name="Target" oor:type="xs:string">
           <value>_self</value>
@@ -94,7 +94,7 @@
       </node>
       <node oor:name="org.codex.librecompleteai.image.settings" oor:op="replace">
         <prop oor:name="URL" oor:type="xs:string">
-          <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$show_settings?language=Python&amp;location=user:uno_packages</value>
+          <value>vnd.librecompleteai:settings</value>
         </prop>
         <node oor:name="UserDefinedImages">
           <prop oor:name="ImageSmall" oor:type="xs:hexBinary">
@@ -107,91 +107,69 @@
       </node>
     </node>
 
-    <node oor:name="OfficeToolbarMerging">
-      <node oor:name="org.codex.librecompleteai.standardbar" oor:op="replace">
-        <prop oor:name="MergeToolBar" oor:type="xs:string">
-          <value>private:resource/toolbar/standardbar</value>
-        </prop>
-        <prop oor:name="MergePoint" oor:type="xs:string">
-          <value/>
-        </prop>
-        <prop oor:name="MergeCommand" oor:type="xs:string">
-          <value>AddLast</value>
-        </prop>
-        <prop oor:name="MergeFallback" oor:type="xs:string">
-          <value>AddLast</value>
-        </prop>
-        <prop oor:name="MergeContext" oor:type="xs:string">
-          <value>com.sun.star.text.TextDocument</value>
-        </prop>
-        <node oor:name="ToolBarItems">
-          <node oor:name="separator" oor:op="replace">
-            <prop oor:name="URL" oor:type="xs:string">
-              <value>private:separator</value>
-            </prop>
-          </node>
-          <node oor:name="toggle" oor:op="replace">
-            <prop oor:name="URL" oor:type="xs:string">
-              <value>vnd.librecompleteai:toggle</value>
-            </prop>
-            <prop oor:name="Title" oor:type="xs:string">
-              <value xml:lang="en-US">LibreCompleteAI On/Off</value>
-            </prop>
-            <prop oor:name="ImageIdentifier" oor:type="xs:string">
-              <value>%origin%/images/toggle</value>
-            </prop>
-            <prop oor:name="Target" oor:type="xs:string">
-              <value>_self</value>
-            </prop>
-            <prop oor:name="ControlType" oor:type="xs:string">
-              <value>ToggleButton</value>
-            </prop>
-          </node>
-          <node oor:name="continuous" oor:op="replace">
-            <prop oor:name="URL" oor:type="xs:string">
-              <value>vnd.librecompleteai:continuous</value>
-            </prop>
-            <prop oor:name="Title" oor:type="xs:string">
-              <value xml:lang="en-US">Continuous Suggestions On/Off</value>
-            </prop>
-            <prop oor:name="ImageIdentifier" oor:type="xs:string">
-              <value>%origin%/images/continuous</value>
-            </prop>
-            <prop oor:name="Target" oor:type="xs:string">
-              <value>_self</value>
-            </prop>
-            <prop oor:name="ControlType" oor:type="xs:string">
-              <value>ToggleButton</value>
-            </prop>
-          </node>
-          <node oor:name="complete" oor:op="replace">
-            <prop oor:name="URL" oor:type="xs:string">
-              <value>vnd.librecompleteai:complete</value>
-            </prop>
-            <prop oor:name="Title" oor:type="xs:string">
-              <value xml:lang="en-US">Complete Now</value>
-            </prop>
-            <prop oor:name="ImageIdentifier" oor:type="xs:string">
-              <value>%origin%/images/complete</value>
-            </prop>
-            <prop oor:name="Target" oor:type="xs:string">
-              <value>_self</value>
-            </prop>
-          </node>
-          <node oor:name="settings" oor:op="replace">
-            <prop oor:name="URL" oor:type="xs:string">
-              <value>vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$show_settings?language=Python&amp;location=user:uno_packages</value>
-            </prop>
-            <prop oor:name="Title" oor:type="xs:string">
-              <value xml:lang="en-US">LibreCompleteAI Settings</value>
-            </prop>
-            <prop oor:name="ImageIdentifier" oor:type="xs:string">
-              <value>%origin%/images/settings</value>
-            </prop>
-            <prop oor:name="Target" oor:type="xs:string">
-              <value>_self</value>
-            </prop>
-          </node>
+    <node oor:name="OfficeToolBar">
+      <node oor:name="org.codex.librecompleteai.toolbar" oor:op="replace">
+        <node oor:name="toggle" oor:op="replace">
+          <prop oor:name="URL" oor:type="xs:string">
+            <value>vnd.librecompleteai:toggle</value>
+          </prop>
+          <prop oor:name="Title" oor:type="xs:string">
+            <value xml:lang="en-US">LC-AI</value>
+          </prop>
+          <prop oor:name="Context" oor:type="xs:string">
+            <value>com.sun.star.text.TextDocument</value>
+          </prop>
+          <prop oor:name="Target" oor:type="xs:string">
+            <value>_self</value>
+          </prop>
+          <prop oor:name="ControlType" oor:type="xs:string">
+            <value>ToggleButton</value>
+          </prop>
+        </node>
+        <node oor:name="continuous" oor:op="replace">
+          <prop oor:name="URL" oor:type="xs:string">
+            <value>vnd.librecompleteai:continuous</value>
+          </prop>
+          <prop oor:name="Title" oor:type="xs:string">
+            <value xml:lang="en-US">Continuous</value>
+          </prop>
+          <prop oor:name="Context" oor:type="xs:string">
+            <value>com.sun.star.text.TextDocument</value>
+          </prop>
+          <prop oor:name="Target" oor:type="xs:string">
+            <value>_self</value>
+          </prop>
+          <prop oor:name="ControlType" oor:type="xs:string">
+            <value>ToggleButton</value>
+          </prop>
+        </node>
+        <node oor:name="complete" oor:op="replace">
+          <prop oor:name="URL" oor:type="xs:string">
+            <value>vnd.librecompleteai:complete</value>
+          </prop>
+          <prop oor:name="Title" oor:type="xs:string">
+            <value xml:lang="en-US">Complete</value>
+          </prop>
+          <prop oor:name="Context" oor:type="xs:string">
+            <value>com.sun.star.text.TextDocument</value>
+          </prop>
+          <prop oor:name="Target" oor:type="xs:string">
+            <value>_self</value>
+          </prop>
+        </node>
+        <node oor:name="settings" oor:op="replace">
+          <prop oor:name="URL" oor:type="xs:string">
+            <value>vnd.librecompleteai:settings</value>
+          </prop>
+          <prop oor:name="Title" oor:type="xs:string">
+            <value xml:lang="en-US">Settings</value>
+          </prop>
+          <prop oor:name="Context" oor:type="xs:string">
+            <value>com.sun.star.text.TextDocument</value>
+          </prop>
+          <prop oor:name="Target" oor:type="xs:string">
+            <value>_self</value>
+          </prop>
         </node>
       </node>
     </node>

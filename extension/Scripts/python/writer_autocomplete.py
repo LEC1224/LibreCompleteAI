@@ -1150,9 +1150,13 @@ def toggle_continuous_suggestions(*args):
     toggle_continuous_suggestions_for_doc(doc)
 
 
-def show_settings(*args):
-    doc = _current_document()
-    ctx = _component_context()
+def show_settings_for_doc(doc=None, ctx=None):
+    if doc is None:
+        try:
+            doc = _current_document()
+        except Exception:
+            doc = None
+    ctx = ctx or _component_context()
     if not ctx:
         raise RuntimeError("LibreOffice component context is not available.")
 
@@ -1166,6 +1170,10 @@ def show_settings(*args):
     finally:
         _DIALOG_LISTENERS.pop(id(dialog), None)
         dialog.dispose()
+
+
+def show_settings(*args):
+    show_settings_for_doc()
 
 
 def _create_settings_dialog(ctx, settings):

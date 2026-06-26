@@ -8,10 +8,10 @@
     <node oor:name="Commands">
       <node oor:name="vnd.librecompleteai:toggle" oor:op="replace">
         <prop oor:name="Label" oor:type="xs:string">
-          <value xml:lang="en-US">LibreCompleteAI On/Off</value>
+          <value xml:lang="en-US">LC-AI</value>
         </prop>
         <prop oor:name="TooltipLabel" oor:type="xs:string">
-          <value xml:lang="en-US">Enable or disable LibreCompleteAI for this Writer window</value>
+          <value xml:lang="en-US">Enable or disable LC-AI for this Writer window</value>
         </prop>
         <prop oor:name="Properties" oor:type="xs:int">
           <value>9</value>
@@ -19,7 +19,7 @@
       </node>
       <node oor:name="vnd.librecompleteai:continuous" oor:op="replace">
         <prop oor:name="Label" oor:type="xs:string">
-          <value xml:lang="en-US">Continuous Suggestions</value>
+          <value xml:lang="en-US">Continuous</value>
         </prop>
         <prop oor:name="TooltipLabel" oor:type="xs:string">
           <value xml:lang="en-US">Suggest ghost text automatically after you type a few words</value>
@@ -30,10 +30,21 @@
       </node>
       <node oor:name="vnd.librecompleteai:complete" oor:op="replace">
         <prop oor:name="Label" oor:type="xs:string">
-          <value xml:lang="en-US">Complete Now</value>
+          <value xml:lang="en-US">Complete</value>
         </prop>
         <prop oor:name="TooltipLabel" oor:type="xs:string">
-          <value xml:lang="en-US">Ask LibreCompleteAI for a suggestion at the cursor</value>
+          <value xml:lang="en-US">Ask LC-AI for a suggestion at the cursor</value>
+        </prop>
+        <prop oor:name="Properties" oor:type="xs:int">
+          <value>1</value>
+        </prop>
+      </node>
+      <node oor:name="vnd.librecompleteai:settings" oor:op="replace">
+        <prop oor:name="Label" oor:type="xs:string">
+          <value xml:lang="en-US">Settings</value>
+        </prop>
+        <prop oor:name="TooltipLabel" oor:type="xs:string">
+          <value xml:lang="en-US">Open LC-AI settings</value>
         </prop>
         <prop oor:name="Properties" oor:type="xs:int">
           <value>1</value>

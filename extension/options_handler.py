@@ -7,6 +7,7 @@ try:
     import unohelper
     from com.sun.star.awt import XAdjustmentListener, XContainerWindowEventHandler
     from com.sun.star.frame import FeatureStateEvent, XDispatch, XDispatchProvider
+    from com.sun.star.frame.status import Visibility
     from com.sun.star.lang import XInitialization, XServiceInfo
 except Exception:
     uno = None
@@ -36,6 +37,10 @@ except Exception:
     class FeatureStateEvent(object):
         pass
 
+    class Visibility(object):
+        def __init__(self, bVisible=False):
+            self.bVisible = bool(bVisible)
+
     class XServiceInfo(object):
         pass
 
@@ -46,7 +51,8 @@ except Exception:
 SERVICE_NAME = "org.codex.librecompleteai.OptionsEventHandler"
 DISPATCH_SERVICE_NAME = "org.codex.librecompleteai.Dispatch"
 DISPATCH_PROTOCOL = "vnd.librecompleteai:"
-SUPPORTED_DISPATCH_COMMANDS = ("toggle", "continuous", "complete")
+SUPPORTED_DISPATCH_COMMANDS = ("toggle", "continuous", "complete", "settings")
+SECONDARY_DISPATCH_COMMANDS = ("continuous", "complete", "settings")
 _RUNTIME_MODULE = None
 DEFAULT_SETTINGS = {
     "provider": "openai",
@@ -237,6 +243,8 @@ class LibreCompleteAIDispatch(unohelper.Base, XServiceInfo, XInitialization, XDi
             runtime.toggle_continuous_suggestions_for_doc(doc)
         elif command == "complete":
             runtime.complete_current_position(doc, preview=runtime.is_autocomplete_enabled(doc))
+        elif command == "settings":
+            runtime.show_settings_for_doc(doc, self.ctx)
         self._notify_all()
 
     def addStatusListener(self, listener, url):
@@ -256,16 +264,37 @@ class LibreCompleteAIDispatch(unohelper.Base, XServiceInfo, XInitialization, XDi
 
     def _notify_listener(self, listener, url):
         try:
-            event = FeatureStateEvent()
-            event.Source = self
-            event.FeatureURL = url
-            event.FeatureDescriptor = ""
-            event.IsEnabled = _url_command(url) in SUPPORTED_DISPATCH_COMMANDS and self._has_writer_document()
-            event.Requery = False
-            event.State = _uno_boolean(self._state_for_url(url))
-            listener.statusChanged(event)
+            command = _url_command(url)
+            if command not in SUPPORTED_DISPATCH_COMMANDS:
+                return
+
+            has_document = self._has_writer_document()
+            autocomplete_enabled = self._is_autocomplete_enabled()
+            is_secondary = command in SECONDARY_DISPATCH_COMMANDS
+            is_visible = has_document and (not is_secondary or autocomplete_enabled)
+
+            if is_secondary:
+                listener.statusChanged(
+                    self._feature_event(url, is_visible, _uno_visibility(is_visible))
+                )
+                if not is_visible:
+                    return
+
+            listener.statusChanged(
+                self._feature_event(url, is_visible, _uno_boolean(self._state_for_url(url)))
+            )
         except Exception:
             pass
+
+    def _feature_event(self, url, enabled, state):
+        event = FeatureStateEvent()
+        event.Source = self
+        event.FeatureURL = url
+        event.FeatureDescriptor = ""
+        event.IsEnabled = bool(enabled)
+        event.Requery = False
+        event.State = state
+        return event
 
     def _state_for_url(self, url):
         command = _url_command(url)
@@ -281,6 +310,14 @@ class LibreCompleteAIDispatch(unohelper.Base, XServiceInfo, XInitialization, XDi
         try:
             runtime = _load_writer_runtime()
             return self._current_writer_document(runtime) is not None
+        except Exception:
+            return False
+
+    def _is_autocomplete_enabled(self):
+        try:
+            runtime = _load_writer_runtime()
+            doc = self._current_writer_document(runtime)
+            return bool(doc is not None and runtime.is_autocomplete_enabled(doc))
         except Exception:
             return False
 
@@ -409,6 +446,16 @@ def _uno_boolean(value):
         except Exception:
             pass
     return bool(value)
+
+
+def _uno_visibility(value):
+    visibility = Visibility(bool(value))
+    if uno is not None:
+        try:
+            return uno.Any("com.sun.star.frame.status.Visibility", visibility)
+        except Exception:
+            pass
+    return visibility
 
 
 def _set_control_text(window, name, value):

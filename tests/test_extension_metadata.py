@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "extension" / "META-INF" / "manifest.xml"
 ADDONS = ROOT / "extension" / "Addons.xcu"
+WRITER_WINDOW_STATE = ROOT / "extension" / "WriterWindowState.xcu"
 EXTENSION_DIR = ROOT / "extension"
 
 
@@ -52,16 +53,50 @@ class ExtensionMetadataTests(unittest.TestCase):
                 continue
             else:
                 self.fail(value)
-        self.assertTrue({"vnd.librecompleteai:toggle", "vnd.librecompleteai:continuous"} <= protocol_commands)
+        self.assertTrue(
+            {
+                "vnd.librecompleteai:toggle",
+                "vnd.librecompleteai:continuous",
+                "vnd.librecompleteai:complete",
+                "vnd.librecompleteai:settings",
+            }
+            <= protocol_commands
+        )
 
-    def test_toolbar_commands_are_icon_backed_and_merged_at_end(self):
+    def test_toolbar_uses_short_text_buttons_without_blank_standardbar_merge(self):
         tree = ET.parse(ADDONS)
         ns = {"oor": "http://openoffice.org/2001/registry"}
         oor_name = f"{{{ns['oor']}}}name"
 
         addon_ui = tree.find(".//node[@oor:name='AddonUI']", ns)
         self.assertIsNotNone(addon_ui)
-        self.assertIsNone(addon_ui.find("node[@oor:name='OfficeToolBar']", ns))
+        self.assertIsNone(addon_ui.find("node[@oor:name='OfficeToolbarMerging']", ns))
+
+        toolbar = addon_ui.find(
+            "node[@oor:name='OfficeToolBar']/node[@oor:name='org.codex.librecompleteai.toolbar']",
+            ns,
+        )
+        self.assertIsNotNone(toolbar)
+        self.assertIsNone(toolbar.find("node[@oor:name='ToolBarItems']", ns))
+        toolbar_items = toolbar.findall("node", ns)
+        toolbar_commands = [
+            (
+                item.attrib[oor_name],
+                item.find("prop[@oor:name='URL']/value", ns).text or "",
+                item.find("prop[@oor:name='Title']/value", ns).text or "",
+            )
+            for item in toolbar_items
+        ]
+        self.assertEqual(
+            toolbar_commands,
+            [
+                ("toggle", "vnd.librecompleteai:toggle", "LC-AI"),
+                ("continuous", "vnd.librecompleteai:continuous", "Continuous"),
+                ("complete", "vnd.librecompleteai:complete", "Complete"),
+                ("settings", "vnd.librecompleteai:settings", "Settings"),
+            ],
+        )
+        self.assertFalse(toolbar.findall(".//prop[@oor:name='ImageIdentifier']", ns))
 
         image_urls = {
             (image.find("prop[@oor:name='URL']/value", ns).text or "")
@@ -72,6 +107,7 @@ class ExtensionMetadataTests(unittest.TestCase):
                 "vnd.librecompleteai:toggle",
                 "vnd.librecompleteai:continuous",
                 "vnd.librecompleteai:complete",
+                "vnd.librecompleteai:settings",
             }
             <= image_urls
         )
@@ -80,29 +116,24 @@ class ExtensionMetadataTests(unittest.TestCase):
             self.assertTrue((image.find(".//prop[@oor:name='ImageSmall']/value", ns).text or "").strip())
             self.assertTrue((image.find(".//prop[@oor:name='ImageBig']/value", ns).text or "").strip())
 
-        toolbar_items = tree.findall(".//node[@oor:name='OfficeToolbarMerging']//node[@oor:name='ToolBarItems']/node", ns)
-        image_identifiers = {
-            (item.find("prop[@oor:name='URL']/value", ns).text or ""): (
-                item.find("prop[@oor:name='ImageIdentifier']/value", ns).text or ""
-            )
-            for item in toolbar_items
-            if item.find("prop[@oor:name='ImageIdentifier']/value", ns) is not None
-        }
-        expected_identifiers = {
-            "vnd.librecompleteai:toggle": "%origin%/images/toggle",
-            "vnd.librecompleteai:continuous": "%origin%/images/continuous",
-            "vnd.librecompleteai:complete": "%origin%/images/complete",
-            "vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$show_settings?language=Python&location=user:uno_packages": "%origin%/images/settings",
-        }
-        self.assertEqual(image_identifiers, expected_identifiers)
-        for identifier in expected_identifiers.values():
-            icon_base = identifier[len("%origin%/") :]
-            self.assertTrue((EXTENSION_DIR / f"{icon_base}_16.bmp").is_file())
-            self.assertTrue((EXTENSION_DIR / f"{icon_base}_26.bmp").is_file())
+        for icon_base in ("toggle", "continuous", "complete", "settings"):
+            self.assertTrue((EXTENSION_DIR / f"images/{icon_base}_16.bmp").is_file())
+            self.assertTrue((EXTENSION_DIR / f"images/{icon_base}_26.bmp").is_file())
 
-        merge_command = tree.find(".//node[@oor:name='OfficeToolbarMerging']//prop[@oor:name='MergeCommand']/value", ns)
-        self.assertIsNotNone(merge_command)
-        self.assertEqual(merge_command.text, "AddLast")
+    def test_toolbar_window_state_forces_text_button_style(self):
+        tree = ET.parse(WRITER_WINDOW_STATE)
+        ns = {"oor": "http://openoffice.org/2001/registry"}
+        state = tree.find(".//node[@oor:name='private:resource/toolbar/addon_org.codex.librecompleteai.toolbar']", ns)
+        self.assertIsNotNone(state)
+
+        values = {
+            prop.attrib[f"{{{ns['oor']}}}name"]: prop.find("value").text or ""
+            for prop in state.findall("prop", ns)
+        }
+        self.assertEqual(values["Visible"], "true")
+        self.assertEqual(values["Docked"], "true")
+        self.assertEqual(values["DockingArea"], "0")
+        self.assertEqual(values["Style"], "1")
 
 
 if __name__ == "__main__":
