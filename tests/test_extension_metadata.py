@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "extension" / "META-INF" / "manifest.xml"
 ADDONS = ROOT / "extension" / "Addons.xcu"
+EXTENSION_DIR = ROOT / "extension"
 
 
 class ExtensionMetadataTests(unittest.TestCase):
@@ -78,6 +79,26 @@ class ExtensionMetadataTests(unittest.TestCase):
         for image in tree.findall(".//node[@oor:name='Images']/node", ns):
             self.assertTrue((image.find(".//prop[@oor:name='ImageSmall']/value", ns).text or "").strip())
             self.assertTrue((image.find(".//prop[@oor:name='ImageBig']/value", ns).text or "").strip())
+
+        toolbar_items = tree.findall(".//node[@oor:name='OfficeToolbarMerging']//node[@oor:name='ToolBarItems']/node", ns)
+        image_identifiers = {
+            (item.find("prop[@oor:name='URL']/value", ns).text or ""): (
+                item.find("prop[@oor:name='ImageIdentifier']/value", ns).text or ""
+            )
+            for item in toolbar_items
+            if item.find("prop[@oor:name='ImageIdentifier']/value", ns) is not None
+        }
+        expected_identifiers = {
+            "vnd.librecompleteai:toggle": "%origin%/images/toggle",
+            "vnd.librecompleteai:continuous": "%origin%/images/continuous",
+            "vnd.librecompleteai:complete": "%origin%/images/complete",
+            "vnd.sun.star.script:LibreCompleteAI.oxt|Scripts|python|writer_autocomplete.py$show_settings?language=Python&location=user:uno_packages": "%origin%/images/settings",
+        }
+        self.assertEqual(image_identifiers, expected_identifiers)
+        for identifier in expected_identifiers.values():
+            icon_base = identifier[len("%origin%/") :]
+            self.assertTrue((EXTENSION_DIR / f"{icon_base}_16.bmp").is_file())
+            self.assertTrue((EXTENSION_DIR / f"{icon_base}_26.bmp").is_file())
 
         merge_command = tree.find(".//node[@oor:name='OfficeToolbarMerging']//prop[@oor:name='MergeCommand']/value", ns)
         self.assertIsNotNone(merge_command)

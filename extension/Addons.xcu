@@ -137,6 +137,9 @@
             <prop oor:name="Title" oor:type="xs:string">
               <value xml:lang="en-US">LibreCompleteAI On/Off</value>
             </prop>
+            <prop oor:name="ImageIdentifier" oor:type="xs:string">
+              <value>%origin%/images/toggle</value>
+            </prop>
             <prop oor:name="Target" oor:type="xs:string">
               <value>_self</value>
             </prop>
@@ -150,6 +153,9 @@
             </prop>
             <prop oor:name="Title" oor:type="xs:string">
               <value xml:lang="en-US">Continuous Suggestions On/Off</value>
+            </prop>
+            <prop oor:name="ImageIdentifier" oor:type="xs:string">
+              <value>%origin%/images/continuous</value>
             </prop>
             <prop oor:name="Target" oor:type="xs:string">
               <value>_self</value>
@@ -165,6 +171,9 @@
             <prop oor:name="Title" oor:type="xs:string">
               <value xml:lang="en-US">Complete Now</value>
             </prop>
+            <prop oor:name="ImageIdentifier" oor:type="xs:string">
+              <value>%origin%/images/complete</value>
+            </prop>
             <prop oor:name="Target" oor:type="xs:string">
               <value>_self</value>
             </prop>
@@ -175,6 +184,9 @@
             </prop>
             <prop oor:name="Title" oor:type="xs:string">
               <value xml:lang="en-US">LibreCompleteAI Settings</value>
+            </prop>
+            <prop oor:name="ImageIdentifier" oor:type="xs:string">
+              <value>%origin%/images/settings</value>
             </prop>
             <prop oor:name="Target" oor:type="xs:string">
               <value>_self</value>
