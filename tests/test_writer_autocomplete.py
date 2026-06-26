@@ -54,7 +54,7 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIn("Return only text", joined)
         self.assertIn("The room was quiet", joined)
         self.assertIn("afterward.", joined)
-        self.assertIn("Aim for 7 words", joined)
+        self.assertIn("Use 7 words", joined)
         self.assertIn("Do not reason", joined)
 
     def test_context_compression_summarizes_older_context(self):
@@ -463,7 +463,7 @@ class WriterAutocompleteTests(unittest.TestCase):
 
         def fake_post_json(url, payload, headers):
             calls.append((url, payload, headers))
-            return {"message": {"content": "the next line", "thinking": "hidden scratchpad"}}
+            return {"response": "the next line", "thinking": "hidden scratchpad"}
 
         original = module._post_json
         module._post_json = fake_post_json
@@ -473,7 +473,33 @@ class WriterAutocompleteTests(unittest.TestCase):
         finally:
             module._post_json = original
 
+        self.assertTrue(calls[0][0].endswith("/api/generate"))
+        self.assertIs(calls[0][1]["raw"], True)
         self.assertIs(calls[0][1]["think"], False)
+        self.assertEqual(calls[0][1]["prompt"], "before")
+        self.assertIn("Okay, let me", calls[0][1]["options"]["stop"])
+
+    def test_request_ollama_chat_adds_qwen_no_think_when_reasoning_is_disabled(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append((url, payload, headers))
+            return {"message": {"content": "the next line"}}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings({"provider": "ollama", "ollama_model": "qwen3:4b"})
+            messages = module.build_summary_messages("Earlier document text.", settings)
+            self.assertEqual(module._request_ollama_messages(messages, settings), "the next line")
+        finally:
+            module._post_json = original
+
+        self.assertTrue(calls[0][0].endswith("/api/chat"))
+        user_messages = [message for message in calls[0][1]["messages"] if message["role"] == "user"]
+        self.assertTrue(user_messages)
+        self.assertTrue(user_messages[0]["content"].rstrip().endswith("/no_think"))
 
     def test_request_ollama_allows_thinking_when_enabled(self):
         module = load_module()
@@ -481,7 +507,7 @@ class WriterAutocompleteTests(unittest.TestCase):
 
         def fake_post_json(url, payload, headers):
             calls.append((url, payload, headers))
-            return {"message": {"content": "the next line"}}
+            return {"response": "the next line"}
 
         original = module._post_json
         module._post_json = fake_post_json
@@ -494,6 +520,8 @@ class WriterAutocompleteTests(unittest.TestCase):
             module._post_json = original
 
         self.assertIs(calls[0][1]["think"], True)
+        self.assertTrue(calls[0][0].endswith("/api/generate"))
+        self.assertNotIn("Okay, let me", calls[0][1]["options"]["stop"])
 
     def test_clean_completion_strips_labels_and_fences(self):
         module = load_module()
@@ -504,6 +532,29 @@ class WriterAutocompleteTests(unittest.TestCase):
         module = load_module()
         text = "<think>I should continue with a sentence.</think>\nCompletion: the candle bent toward the draft."
         self.assertEqual(module.clean_completion(text), "the candle bent toward the draft.")
+
+    def test_clean_completion_extracts_labeled_answer_after_meta_reasoning(self):
+        module = load_module()
+        text = (
+            "Okay, let me tackle this. The user wants me to act as an inline autocomplete engine.\n\n"
+            "First, I need to inspect the text before the cursor and think about word count.\n\n"
+            'Possible continuation: "how it transforms your writing process without disrupting your creative flow." '
+            "Let me count the words."
+        )
+        self.assertEqual(
+            module.clean_completion(text, max_words=24),
+            "how it transforms your writing process without disrupting your creative flow.",
+        )
+
+    def test_clean_completion_discards_unlabeled_meta_reasoning(self):
+        module = load_module()
+        text = "Okay, let me tackle this. The user wants me to continue text at the cursor."
+        self.assertEqual(module.clean_completion(text), "")
+
+    def test_clean_completion_caps_overlong_completion(self):
+        module = load_module()
+        text = "one two three four five six"
+        self.assertEqual(module.clean_completion(text, max_words=4), "one two three four")
 
     def test_clean_completion_removes_echoed_prefix_tail(self):
         module = load_module()

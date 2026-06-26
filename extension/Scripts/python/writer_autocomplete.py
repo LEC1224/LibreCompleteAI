@@ -61,6 +61,8 @@ Return only text that should be inserted at the cursor.
 Do not explain, label, quote, or wrap the completion.
 Do not think step by step, reason out loud, or include analysis.
 Do not output <think> blocks or hidden reasoning.
+Do not mention the user, prompt, cursor, model, task, instructions, or word count.
+Do not write prefaces such as "Okay", "Let me", "Here is", or "Possible continuation".
 Do not repeat text that is already before the cursor.
 Prefer a concise continuation: a phrase, clause, sentence, or short paragraph.
 Preserve the author's language, tone, tense, person, and formatting conventions.
@@ -225,7 +227,7 @@ def build_messages(prefix, suffix, settings):
         "<after>\n"
         f"{suffix}\n"
         "</after>\n\n"
-        f"Return only the text to insert at <cursor>. Aim for {max_words} words or fewer."
+        f"Return only the text to insert at <cursor>. Start directly with document text. Use {max_words} words or fewer."
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -254,7 +256,7 @@ def build_summary_messages(text, settings):
     ]
 
 
-def clean_completion(text, prefix=""):
+def clean_completion(text, prefix="", max_words=None):
     if not text:
         return ""
 
@@ -263,18 +265,22 @@ def clean_completion(text, prefix=""):
     text = re.sub(r"^\s*```[a-zA-Z0-9_-]*\s*", "", text)
     text = re.sub(r"\s*```\s*$", "", text)
     text = text.strip("\n")
+    text = _extract_labeled_completion(text)
 
     stripped = text.strip()
-    for label in ("Completion:", "Suggestion:", "Insert:", "Continuation:"):
+    for label in ("Completion:", "Suggestion:", "Insert:", "Continuation:", "Possible continuation:"):
         if stripped.lower().startswith(label.lower()):
             text = stripped[len(label) :].lstrip()
             stripped = text.strip()
             break
 
-    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
-        text = stripped[1:-1]
+    text = _strip_outer_quotes(text)
+
+    if _looks_like_meta_response(text):
+        return ""
 
     text = _remove_prefix_echo(prefix, text)
+    text = _limit_completion_words(text, max_words)
     return text.rstrip()
 
 
@@ -288,6 +294,86 @@ def _strip_reasoning_blocks(text):
     text = re.sub(r"(?is)<think>.*?</think>\s*", "", text)
     text = re.sub(r"(?is)^\s*(analysis|reasoning|thoughts?)\s*:\s*.*?(?=\n\s*(final|completion|suggestion)\s*:|\Z)", "", text)
     return text
+
+
+def _extract_labeled_completion(text):
+    matches = list(
+        re.finditer(
+            r"(?im)(?:^|\n)\s*(?:possible\s+)?(?:completion|suggestion|continuation|insert|final(?: answer)?|output)\s*:\s*",
+            text,
+        )
+    )
+    if not matches:
+        return text
+    return _strip_outer_quotes(text[matches[-1].end() :].lstrip())
+
+
+def _strip_outer_quotes(text):
+    stripped = text.strip()
+    for opener, closer in (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’")):
+        if stripped.startswith(opener):
+            end = stripped.find(closer, len(opener))
+            if end > 0:
+                return stripped[len(opener) : end]
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"', "“", "”", "‘", "’"):
+        return stripped[1:-1]
+    return text
+
+
+def _looks_like_meta_response(text):
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lower = stripped[:1600].lower()
+    strong_starts = (
+        "let me",
+        "i need",
+        "i should",
+        "i will",
+        "i'll",
+        "first,",
+        "hmm",
+        "wait,",
+        "the user wants",
+        "the task",
+        "the text before",
+        "the cursor",
+    )
+    if lower.startswith(strong_starts):
+        return True
+
+    markers = (
+        "the user wants",
+        "the task is",
+        "the cursor",
+        "text before the cursor",
+        "provided text",
+        "return only",
+        "insert at <cursor>",
+        "possible continuation",
+        "let me count",
+        "word count",
+        "i need to",
+        "i should",
+    )
+    if lower.startswith(("okay,", "ok,", "sure,")) and any(marker in lower for marker in markers):
+        return True
+    return sum(1 for marker in markers if marker in lower) >= 2
+
+
+def _limit_completion_words(text, max_words):
+    if max_words is None:
+        return text
+    try:
+        max_words = int(max_words)
+    except Exception:
+        return text
+    if max_words <= 0:
+        return ""
+    matches = list(re.finditer(r"\S+", text or ""))
+    if len(matches) <= max_words:
+        return text
+    return text[: matches[max_words - 1].end()]
 
 
 def _remove_prefix_echo(prefix, completion):
@@ -305,12 +391,12 @@ def _remove_prefix_echo(prefix, completion):
 def request_completion(prefix, suffix, settings, cache_key=None):
     settings = normalize_settings(settings)
     prefix = _compress_context_if_needed(prefix, settings, cache_key)
-    messages = build_messages(prefix, suffix, settings)
     if settings["provider"] == "ollama":
-        raw = _request_ollama_messages(messages, settings, _completion_token_limit(settings))
+        raw = _request_ollama_completion(prefix, suffix, settings, _completion_token_limit(settings))
     else:
+        messages = build_messages(prefix, suffix, settings)
         raw = _request_openai_messages(messages, settings, _completion_token_limit(settings))
-    return clean_completion(raw, prefix)
+    return clean_completion(raw, prefix, max_words=_prediction_words(settings))
 
 
 def _request_openai(prefix, suffix, settings):
@@ -352,11 +438,55 @@ def _request_openai_messages(messages, settings, token_limit=None, temperature=N
 
 
 def _request_ollama(prefix, suffix, settings):
-    return _request_ollama_messages(
-        build_messages(prefix, suffix, settings),
-        settings,
-        _completion_token_limit(settings),
-    )
+    return _request_ollama_completion(prefix, suffix, settings, _completion_token_limit(settings))
+
+
+def _request_ollama_completion(prefix, suffix, settings, token_limit=None, temperature=None):
+    model = settings.get("ollama_model")
+    if not model:
+        raise RuntimeError("Ollama provider is selected, but no model label is configured.")
+
+    host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
+    payload = {
+        "model": model,
+        "prompt": _ollama_completion_prompt(prefix, suffix, settings),
+        "stream": False,
+        "raw": True,
+        "think": _ollama_think_setting(settings),
+        "options": {
+            "temperature": _float_setting(settings, "temperature") if temperature is None else temperature,
+            "num_predict": token_limit or _completion_token_limit(settings),
+            "stop": _ollama_completion_stop_sequences(settings),
+        },
+    }
+    response = _post_json(host + "/api/generate", payload, {"Content-Type": "application/json"})
+    try:
+        return response.get("response", "")
+    except Exception:
+        raise RuntimeError("Ollama response did not include generated text.")
+
+
+def _ollama_completion_prompt(prefix, suffix, settings):
+    return prefix or ""
+
+
+def _ollama_completion_stop_sequences(settings):
+    stop = ["\n\n"]
+    if not _bool_setting(settings, "allow_reasoning"):
+        stop.extend(
+            [
+                "<think>",
+                "</think>",
+                "Okay, let me",
+                "Ok, let me",
+                "Hmm,",
+                "The user",
+                "I need to",
+                "I should",
+                "Possible continuation:",
+            ]
+        )
+    return stop
 
 
 def _request_ollama_messages(messages, settings, token_limit=None, temperature=None):
@@ -367,7 +497,7 @@ def _request_ollama_messages(messages, settings, token_limit=None, temperature=N
     host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
     payload = {
         "model": model,
-        "messages": messages,
+        "messages": _ollama_messages_for_request(messages, settings),
         "stream": False,
         "think": _ollama_think_setting(settings),
         "options": {
@@ -385,6 +515,29 @@ def _request_ollama_messages(messages, settings, token_limit=None, temperature=N
 
 def _ollama_think_setting(settings):
     return True if _bool_setting(settings, "allow_reasoning") else False
+
+
+def _ollama_messages_for_request(messages, settings):
+    if _bool_setting(settings, "allow_reasoning") or not _is_qwen3_model(settings.get("ollama_model", "")):
+        return messages
+
+    updated = []
+    added = False
+    for message in messages:
+        item = dict(message)
+        if not added and item.get("role") == "user":
+            content = str(item.get("content", "")).rstrip()
+            item["content"] = content + "\n\n/no_think"
+            added = True
+        updated.append(item)
+
+    if not added:
+        updated.append({"role": "user", "content": "/no_think"})
+    return updated
+
+
+def _is_qwen3_model(model):
+    return "qwen3" in str(model or "").lower()
 
 
 def _post_openai_chat_completion(url, payload, headers):
