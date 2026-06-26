@@ -73,10 +73,13 @@ _CONTEXT_SUMMARIES = {}
 _LAST_AUTO_REQUEST = {}
 _LAST_AUTO_PREFIX = {}
 _CONTINUOUS_REQUESTS = {}
+_CONTINUOUS_TIMERS = {}
 _CONTINUOUS_LOCK = threading.RLock()
 _CONTINUOUS_SEQUENCE = 0
+_CONTINUOUS_TIMER_SEQUENCE = 0
 _DIALOG_LISTENERS = {}
 CONTINUOUS_MIN_INTERVAL_SECONDS = 0.75
+CONTINUOUS_IDLE_DELAY_SECONDS = 0.85
 CONTINUOUS_TRIGGER_WORDS = 3
 SUMMARY_REFRESH_WORDS = 120
 SUMMARY_RECENT_MIN_WORDS = 80
@@ -739,14 +742,68 @@ def complete_current_position(doc=None, preview=True, quiet=False):
 
 
 def _maybe_start_continuous_request(doc, event):
+    return _schedule_continuous_request_after_idle(doc, event)
+
+
+def _schedule_continuous_request_after_idle(doc, event=None):
     if _has_ghost(doc):
+        return False
+    if event is not None and not _is_continuous_typing_event(event):
         return False
     settings = load_settings()
     if not _bool_setting(settings, "continuous_suggestions"):
         return False
-    if not _is_continuous_boundary(event):
-        return False
-    return _start_continuous_request(doc, settings)
+
+    key = _doc_key(doc)
+    timer_id = _next_continuous_timer_id()
+    timer = threading.Timer(
+        CONTINUOUS_IDLE_DELAY_SECONDS,
+        _continuous_idle_timer_fired,
+        args=(doc, key, timer_id),
+    )
+    timer.daemon = True
+
+    with _CONTINUOUS_LOCK:
+        _cancel_continuous_timer_locked(key)
+        _CONTINUOUS_TIMERS[key] = {
+            "id": timer_id,
+            "timer": timer,
+        }
+
+    timer.start()
+    return True
+
+
+def _continuous_idle_timer_fired(doc, key, timer_id):
+    with _CONTINUOUS_LOCK:
+        current = _CONTINUOUS_TIMERS.get(key)
+        if not current or current.get("id") != timer_id:
+            return
+        _CONTINUOUS_TIMERS.pop(key, None)
+
+    try:
+        settings = load_settings()
+        if _bool_setting(settings, "continuous_suggestions"):
+            _start_continuous_request(doc, settings)
+    except Exception:
+        pass
+
+
+def _next_continuous_timer_id():
+    global _CONTINUOUS_TIMER_SEQUENCE
+    with _CONTINUOUS_LOCK:
+        _CONTINUOUS_TIMER_SEQUENCE += 1
+        return _CONTINUOUS_TIMER_SEQUENCE
+
+
+def _cancel_continuous_timer_locked(key):
+    current = _CONTINUOUS_TIMERS.pop(key, None)
+    if not current:
+        return
+    try:
+        current["timer"].cancel()
+    except Exception:
+        pass
 
 
 def _start_continuous_request(doc, settings, force=False):
@@ -891,6 +948,7 @@ def _reset_continuous_baseline(doc, settings):
     except Exception:
         prefix = ""
     with _CONTINUOUS_LOCK:
+        _cancel_continuous_timer_locked(key)
         _LAST_AUTO_PREFIX[key] = prefix
         _LAST_AUTO_REQUEST.pop(key, None)
         _CONTINUOUS_REQUESTS.pop(key, None)
@@ -898,6 +956,7 @@ def _reset_continuous_baseline(doc, settings):
 
 def _clear_continuous_state(key):
     with _CONTINUOUS_LOCK:
+        _cancel_continuous_timer_locked(key)
         _LAST_AUTO_PREFIX.pop(key, None)
         _LAST_AUTO_REQUEST.pop(key, None)
         _CONTINUOUS_REQUESTS.pop(key, None)
@@ -925,6 +984,8 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
             if key_code == TAB and modifiers == 0:
                 complete_current_position(self.doc, preview=True)
                 return True
+
+            _schedule_continuous_request_after_idle(self.doc, event)
         except Exception as exc:
             _message_box(self.doc, EXTENSION_NAME, str(exc))
             return True
@@ -958,6 +1019,19 @@ def _is_continuous_boundary(event):
 
 def _is_continuous_trigger(event):
     return _is_continuous_boundary(event)
+
+
+def _is_continuous_typing_event(event):
+    if getattr(event, "Modifiers", 0) != 0:
+        return False
+    key_code = getattr(event, "KeyCode", None)
+    if key_code in (TAB, ESCAPE):
+        return False
+
+    char = str(getattr(event, "KeyChar", "") or "")
+    if not char:
+        return False
+    return char.isspace() or char.isprintable()
 
 
 def is_autocomplete_enabled(doc=None):

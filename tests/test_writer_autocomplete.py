@@ -137,6 +137,67 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertTrue(module._is_continuous_trigger(Event(" ")))
         self.assertTrue(module._is_continuous_trigger(Event(".")))
         self.assertFalse(module._is_continuous_trigger(Event("a")))
+        self.assertTrue(module._is_continuous_typing_event(Event("a")))
+        self.assertTrue(module._is_continuous_typing_event(Event(" ")))
+
+    def test_continuous_idle_timer_debounces_typing(self):
+        module = load_module()
+
+        class Event:
+            KeyCode = 0
+            Modifiers = 0
+
+            def __init__(self, char):
+                self.KeyChar = char
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "doc-with-idle-typing"
+
+        class FakeTimer:
+            instances = []
+
+            def __init__(self, delay, target, args=()):
+                self.delay = delay
+                self.target = target
+                self.args = args
+                self.started = False
+                self.cancelled = False
+                self.daemon = False
+                FakeTimer.instances.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+            def fire(self):
+                self.target(*self.args)
+
+        calls = []
+        original_timer = module.threading.Timer
+        original_load = module.load_settings
+        original_start = module._start_continuous_request
+        module.threading.Timer = FakeTimer
+        module.load_settings = lambda: module.normalize_settings({"continuous_suggestions": "true"})
+        module._start_continuous_request = lambda doc, settings, force=False: calls.append((doc, force)) or True
+        try:
+            doc = Doc()
+            self.assertTrue(module._schedule_continuous_request_after_idle(doc, Event("t")))
+            self.assertTrue(module._schedule_continuous_request_after_idle(doc, Event("o")))
+            self.assertEqual(len(FakeTimer.instances), 2)
+            self.assertTrue(FakeTimer.instances[0].cancelled)
+
+            FakeTimer.instances[0].fire()
+            self.assertEqual(calls, [])
+            FakeTimer.instances[1].fire()
+            self.assertEqual(calls, [(doc, False)])
+        finally:
+            module.threading.Timer = original_timer
+            module.load_settings = original_load
+            module._start_continuous_request = original_start
+            module._clear_continuous_state("doc-with-idle-typing")
 
     def test_reconcile_continuous_completion_keeps_remaining_match(self):
         module = load_module()
