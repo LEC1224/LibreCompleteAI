@@ -41,11 +41,27 @@ class OptionsHandlerTests(unittest.TestCase):
 
     def test_normalize_settings_rejects_unknown_provider(self):
         module = load_module()
-        settings = module.normalize_settings({"provider": "bad"})
+        settings = module.normalize_settings({"provider": "bad", "suffix_chars": "999"})
         self.assertEqual(settings["provider"], "openai")
+        self.assertNotIn("suffix_chars", settings)
         self.assertEqual(settings["continuous_suggestions"], "false")
         self.assertEqual(settings["allow_reasoning"], "false")
+        self.assertEqual(settings["ollama_model"], "qwen3.5:4b")
+        self.assertEqual(settings["ollama_completion_mode"], "auto")
         self.assertEqual(settings["max_context_words"], "600")
+
+    def test_normalize_settings_validates_ollama_completion_mode(self):
+        module = load_module()
+        self.assertEqual(
+            module.normalize_settings({"ollama_completion_mode": "RAW"})["ollama_completion_mode"],
+            "raw",
+        )
+        self.assertEqual(
+            module.normalize_settings({"ollama_completion_mode": "invalid"})[
+                "ollama_completion_mode"
+            ],
+            "auto",
+        )
 
     def test_normalize_settings_does_not_copy_env_api_key(self):
         module = load_module()

@@ -7,10 +7,19 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "extension" / "META-INF" / "manifest.xml"
 ADDONS = ROOT / "extension" / "Addons.xcu"
 WRITER_WINDOW_STATE = ROOT / "extension" / "WriterWindowState.xcu"
+OPTIONS_DIALOG = ROOT / "extension" / "options" / "LibreCompleteAI.xdl"
 EXTENSION_DIR = ROOT / "extension"
 
 
 class ExtensionMetadataTests(unittest.TestCase):
+    def test_options_dialog_exposes_ollama_completion_mode(self):
+        tree = ET.parse(OPTIONS_DIALOG)
+        ns = {"dlg": "http://openoffice.org/2000/dialog"}
+        control = tree.find(".//*[@dlg:id='ollama_completion_mode']", ns)
+        self.assertIsNotNone(control)
+        self.assertEqual(control.attrib[f"{{{ns['dlg']}}}value"], "auto")
+        self.assertIn("guided", control.attrib[f"{{{ns['dlg']}}}help-text"])
+
     def test_manifest_exports_python_scripts_to_script_provider(self):
         tree = ET.parse(MANIFEST)
         ns = {"manifest": "http://openoffice.org/2001/manifest"}

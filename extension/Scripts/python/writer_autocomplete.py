@@ -53,7 +53,8 @@ DEFAULT_SETTINGS = {
     "openai_base_url": "https://api.openai.com/v1",
     "openai_model": "gpt-4.1-mini",
     "ollama_host": "http://localhost:11434",
-    "ollama_model": "llama3.2",
+    "ollama_model": "qwen3.5:4b",
+    "ollama_completion_mode": "auto",
     "temperature": "0.45",
     "max_tokens": "96",
     "prediction_words": "24",
@@ -61,7 +62,6 @@ DEFAULT_SETTINGS = {
     "allow_reasoning": "false",
     "max_context_words": "600",
     "prefix_chars": "2400",
-    "suffix_chars": "600",
     "writing_guidance": "Match the author's language, tone, point of view, and pacing.",
 }
 
@@ -77,6 +77,18 @@ Prefer a concise continuation: a phrase, clause, sentence, or short paragraph.
 Preserve the author's language, tone, tense, person, and formatting conventions.
 If no helpful continuation is possible, return an empty string."""
 
+OLLAMA_STRUCTURED_SYSTEM_PROMPT = """You are an inline autocomplete engine for prose in LibreOffice Writer.
+Respond with exactly one JSON object containing a single string property named "completion".
+The completion value must contain only text that should be inserted at the cursor.
+Do not explain, label, quote, or wrap the completion inside that string.
+Do not think step by step, reason out loud, or include analysis in the completion.
+Do not mention the user, prompt, cursor, model, task, instructions, JSON, schema, or word count.
+Do not write prefaces such as "Okay", "Let me", "Here is", or "Possible continuation".
+Do not repeat text that is already before the cursor.
+Prefer a concise continuation: a phrase, clause, sentence, or short paragraph.
+Preserve the author's language, tone, tense, person, and formatting conventions.
+If no helpful continuation is possible, use an empty completion string."""
+
 SUMMARY_PROMPT = """You compress prose context for an inline writing autocomplete engine.
 Preserve the facts, names, chronology, unresolved questions, tone, language, and point of view.
 Do not continue the story or document.
@@ -87,6 +99,9 @@ _BUSY_DOCS = set()
 _GHOSTS = {}
 _CONTEXT_SUMMARIES = {}
 _REGENERATION_STATES = {}
+_OLLAMA_GUIDED_UNAVAILABLE = set()
+_OLLAMA_GUIDED_FAILURES = {}
+_OLLAMA_GUIDED_LOCK = threading.RLock()
 _LAST_AUTO_REQUEST = {}
 _LAST_AUTO_PREFIX = {}
 _CONTINUOUS_REQUESTS = {}
@@ -103,6 +118,19 @@ SUMMARY_RECENT_MIN_WORDS = 80
 SUMMARY_RECENT_RATIO = 0.5
 MAX_CONTEXT_CHAR_CAP = 80000
 MAX_REJECTED_COMPLETIONS = 3
+OLLAMA_COMPLETION_MODES = ("auto", "guided", "raw")
+OLLAMA_KEEP_ALIVE = "30m"
+OLLAMA_STRUCTURED_TOKEN_OVERHEAD = 12
+OLLAMA_GUIDED_FAILURE_THRESHOLD = 2
+OLLAMA_MIN_CONTEXT_TOKENS = 2048
+OLLAMA_MAX_CONTEXT_TOKENS = 16384
+OLLAMA_CONTEXT_RESERVE_TOKENS = 512
+OLLAMA_COMPLETION_SCHEMA = {
+    "type": "object",
+    "properties": {"completion": {"type": "string"}},
+    "required": ["completion"],
+    "additionalProperties": False,
+}
 SETTINGS_FIELDS = (
     "provider",
     "openai_api_key",
@@ -110,6 +138,7 @@ SETTINGS_FIELDS = (
     "openai_model",
     "ollama_host",
     "ollama_model",
+    "ollama_completion_mode",
     "temperature",
     "max_tokens",
     "prediction_words",
@@ -117,7 +146,6 @@ SETTINGS_FIELDS = (
     "allow_reasoning",
     "max_context_words",
     "prefix_chars",
-    "suffix_chars",
     "writing_guidance",
 )
 INTEGER_SETTINGS = (
@@ -125,7 +153,6 @@ INTEGER_SETTINGS = (
     "prediction_words",
     "max_context_words",
     "prefix_chars",
-    "suffix_chars",
 )
 BOOLEAN_SETTINGS = ("continuous_suggestions", "allow_reasoning")
 SLIDER_SETTINGS = {
@@ -161,11 +188,18 @@ def normalize_settings(settings):
     merged = dict(DEFAULT_SETTINGS)
     if settings:
         merged.update(settings)
+    # Remove the retired after-cursor setting from older saved configurations.
+    merged.pop("suffix_chars", None)
 
     provider = str(merged.get("provider", "openai")).strip().lower()
     if provider not in ("openai", "ollama"):
         provider = "openai"
     merged["provider"] = provider
+
+    ollama_mode = str(merged.get("ollama_completion_mode", "auto")).strip().lower()
+    if ollama_mode not in OLLAMA_COMPLETION_MODES:
+        ollama_mode = "auto"
+    merged["ollama_completion_mode"] = ollama_mode
 
     for key in SETTINGS_FIELDS:
         merged[key] = str(merged.get(key, DEFAULT_SETTINGS[key])).strip()
@@ -264,12 +298,33 @@ def _summary_token_limit(settings):
     return max(96, min(512, max_context_words // 2))
 
 
-def build_messages(prefix, suffix, settings, regeneration=None):
+def build_messages(prefix, suffix, settings, regeneration=None, structured=False):
+    # `suffix` remains in the internal signature for compatibility with older
+    # callers, but text after the cursor is intentionally never sent to a
+    # provider. The insertion point behaves like a temporary document end.
     max_words = _prediction_words(settings)
     min_words = max(1, int(math.floor(max_words * 0.8)))
     guidance = settings.get("writing_guidance") or DEFAULT_SETTINGS["writing_guidance"]
     reasoning_instruction = _reasoning_instruction(settings)
     regeneration_instruction = _regeneration_instruction(regeneration, max_words)
+    length_instruction = (
+        f"Aim for {max_words} words; when the document can be continued naturally, use "
+        f"{min_words}-{max_words} words. Never exceed {max_words} words."
+    )
+
+    if structured:
+        response_instruction = (
+            'Return one JSON object matching the provided schema. Put only the insertable document text in the '
+            f'"completion" string. {length_instruction}'
+        )
+        system_prompt = OLLAMA_STRUCTURED_SYSTEM_PROMPT
+    else:
+        response_instruction = (
+            f"Return only the text to insert at <cursor>. Start directly with document text. "
+            f"{length_instruction}"
+        )
+        system_prompt = SYSTEM_PROMPT
+
     user_prompt = (
         "Continue the document at <cursor>.\n\n"
         "Writing guidance:\n"
@@ -280,16 +335,12 @@ def build_messages(prefix, suffix, settings, regeneration=None):
         "<before>\n"
         f"{prefix}\n"
         "</before>\n\n"
-        "Text after <cursor>:\n"
-        "<after>\n"
-        f"{suffix}\n"
-        "</after>\n\n"
-        f"Return only the text to insert at <cursor>. Start directly with document text. "
-        f"Aim for {max_words} words; when the document can be continued naturally, use {min_words}-{max_words} words. "
-        f"Never exceed {max_words} words."
+        "Treat <cursor> as the current end of the document. Do not infer, inspect, or account for any "
+        "already-written text that may exist after it.\n\n"
+        f"{response_instruction}"
     )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -302,7 +353,7 @@ def _regeneration_instruction(regeneration, target_words):
     directions = (
         "Take a different narrative or argumentative direction from the rejected attempt.",
         "Try a fresh angle with a noticeably different sentence structure and emphasis.",
-        "Prefer a less obvious but still seamless next idea, image, detail, or action.",
+        "Prefer a less obvious but still natural next idea, image, detail, or action.",
     )
     instruction = directions[(attempt - 1) % len(directions)]
     rejected = [str(item).strip() for item in regeneration.get("rejected", ()) if str(item).strip()]
@@ -310,9 +361,12 @@ def _regeneration_instruction(regeneration, target_words):
     if rejected:
         rejected_lines = "\n".join(f"- {item[:500]}" for item in rejected[-MAX_REJECTED_COMPLETIONS:])
         rejected_block = f"\nDo not repeat these rejected suggestions:\n{rejected_lines}"
+    length_instruction = (
+        f"Keep the requested length near {target_words} words; "
+        "do not shorten it merely because this is a retry."
+    )
     return (
-        f"Regeneration attempt {attempt}: {instruction} "
-        f"Keep the requested length near {target_words} words; do not shorten it merely because this is a retry."
+        f"Regeneration attempt {attempt}: {instruction} {length_instruction}"
         f"{rejected_block}\n\n"
     )
 
@@ -465,14 +519,36 @@ def _remove_prefix_echo(prefix, completion):
     tail = prefix[-240:]
     max_size = min(len(tail), len(completion), 120)
     for size in range(max_size, 7, -1):
-        if tail[-size:] == completion[:size]:
+        overlap = completion[:size]
+        if tail[-size:] == overlap and _safe_prefix_echo_overlap(tail, completion, size):
             return completion[size:]
     return completion
+
+
+def _safe_prefix_echo_overlap(prefix_tail, completion, size):
+    overlap = completion[:size]
+    # Removing a single repeated long word can turn a valid continuation such
+    # as "creature of ancient mind" into the fragment "of ancient mind".
+    # Require a phrase-sized echo and ensure neither edge cuts through a word.
+    if len(re.findall(r"[\w’'-]+", overlap, flags=re.UNICODE)) < 2:
+        return False
+    start = len(prefix_tail) - size
+    if start > 0 and _is_word_body_char(prefix_tail[start - 1]) and _is_word_body_char(overlap[0]):
+        return False
+    if size < len(completion) and _is_word_body_char(overlap[-1]) and _is_word_body_char(completion[size]):
+        return False
+    return True
 
 
 def request_completion(prefix, suffix, settings, cache_key=None, regeneration=None):
     settings = normalize_settings(settings)
     prefix = _compress_context_if_needed(prefix, settings, cache_key)
+    # Deliberately discard any supplied suffix. Autocomplete is a forward
+    # continuation from the cursor, even when the user is editing mid-file.
+    return _generate_completion_once(prefix, "", settings, regeneration)
+
+
+def _generate_completion_once(prefix, suffix, settings, regeneration=None):
     if settings["provider"] == "ollama":
         raw = _request_ollama_completion(
             prefix,
@@ -526,10 +602,54 @@ def _request_openai_messages(messages, settings, token_limit=None, temperature=N
 
 
 def _request_ollama(prefix, suffix, settings):
+    settings = normalize_settings(settings)
     return _request_ollama_completion(prefix, suffix, settings, _completion_token_limit(settings))
 
 
 def _request_ollama_completion(
+    prefix,
+    suffix,
+    settings,
+    token_limit=None,
+    temperature=None,
+    regeneration=None,
+):
+    mode = settings.get("ollama_completion_mode", "auto")
+    if mode == "raw":
+        return _request_ollama_raw_completion(
+            prefix, suffix, settings, token_limit, temperature, regeneration
+        )
+
+    cache_key = _ollama_guided_cache_key(settings)
+    if mode == "auto" and _ollama_guided_is_unavailable(cache_key):
+        return _ollama_auto_raw_fallback(
+            prefix, suffix, settings, token_limit, temperature, regeneration
+        )
+
+    try:
+        completion = _request_ollama_guided_completion(
+            prefix, suffix, settings, token_limit, temperature, regeneration
+        )
+        _note_ollama_guided_success(cache_key)
+        return completion
+    except _GuidedCompletionError:
+        if mode == "guided":
+            raise
+        _note_ollama_guided_failure(cache_key)
+    except _HttpJsonError as exc:
+        if mode == "guided":
+            raise
+        _note_ollama_guided_failure(
+            cache_key,
+            permanent=_is_ollama_guided_unsupported(exc),
+        )
+
+    return _ollama_auto_raw_fallback(
+        prefix, suffix, settings, token_limit, temperature, regeneration
+    )
+
+
+def _request_ollama_guided_completion(
     prefix,
     suffix,
     settings,
@@ -542,21 +662,94 @@ def _request_ollama_completion(
         raise RuntimeError("Ollama provider is selected, but no model label is configured.")
 
     host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
-    request_temperature = _float_setting(settings, "temperature") if temperature is None else temperature
-    if regeneration and regeneration.get("attempt"):
-        # Raw Ollama generation deliberately has no metaprompt because any
-        # instruction text can leak into the prose. Increase sampling diversity
-        # slightly on explicit retries while preserving the same output budget.
-        request_temperature = min(1.2, request_temperature + min(int(regeneration["attempt"]), 4) * 0.08)
+    base_limit = token_limit or _completion_token_limit(settings)
+    messages = build_messages(
+        prefix,
+        suffix,
+        settings,
+        regeneration=regeneration,
+        structured=True,
+    )
+    payload = {
+        "model": model,
+        "messages": _ollama_messages_for_request(messages, settings),
+        "stream": False,
+        "format": OLLAMA_COMPLETION_SCHEMA,
+        "think": _ollama_think_setting(settings),
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {
+            "temperature": _ollama_request_temperature(settings, temperature, regeneration),
+            # The JSON envelope is never inserted into the document, so give it
+            # a small allowance beyond the user's semantic completion budget.
+            "num_predict": base_limit + OLLAMA_STRUCTURED_TOKEN_OVERHEAD,
+            "num_ctx": _ollama_context_window_for_messages(
+                messages,
+                base_limit + OLLAMA_STRUCTURED_TOKEN_OVERHEAD,
+            ),
+        },
+    }
+    response = _post_json(host + "/api/chat", payload, {"Content-Type": "application/json"})
+    try:
+        content = response["message"]["content"]
+    except Exception:
+        raise _GuidedCompletionError("Ollama guided mode did not return a chat message.")
+
+    try:
+        parsed = content if isinstance(content, dict) else json.loads(str(content))
+        completion = parsed["completion"]
+        if not isinstance(completion, str):
+            raise TypeError("completion is not text")
+    except Exception:
+        raise _GuidedCompletionError("Ollama guided mode returned invalid structured output.")
+
+    if not completion.strip():
+        return ""
+    cleaned = clean_completion(completion, prefix, max_words=_prediction_words(settings))
+    if not cleaned.strip():
+        raise _GuidedCompletionError("Ollama guided mode did not return a useful continuation.")
+    return cleaned
+
+
+def _ollama_auto_raw_fallback(
+    prefix,
+    suffix,
+    settings,
+    token_limit=None,
+    temperature=None,
+    regeneration=None,
+):
+    return _request_ollama_raw_completion(
+        prefix, "", settings, token_limit, temperature, regeneration
+    )
+
+
+def _request_ollama_raw_completion(
+    prefix,
+    suffix,
+    settings,
+    token_limit=None,
+    temperature=None,
+    regeneration=None,
+):
+    model = settings.get("ollama_model")
+    if not model:
+        raise RuntimeError("Ollama provider is selected, but no model label is configured.")
+
+    host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
     payload = {
         "model": model,
         "prompt": _ollama_completion_prompt(prefix, suffix, settings),
         "stream": False,
         "raw": True,
         "think": _ollama_think_setting(settings),
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
-            "temperature": request_temperature,
+            "temperature": _ollama_request_temperature(settings, temperature, regeneration),
             "num_predict": token_limit or _completion_token_limit(settings),
+            "num_ctx": _ollama_context_window(
+                _ollama_completion_prompt(prefix, suffix, settings),
+                token_limit or _completion_token_limit(settings),
+            ),
             "stop": _ollama_completion_stop_sequences(settings),
         },
     }
@@ -565,6 +758,69 @@ def _request_ollama_completion(
         return response.get("response", "")
     except Exception:
         raise RuntimeError("Ollama response did not include generated text.")
+
+
+def _ollama_request_temperature(settings, temperature=None, regeneration=None):
+    value = _float_setting(settings, "temperature") if temperature is None else temperature
+    if regeneration and regeneration.get("attempt"):
+        value = min(1.2, value + min(int(regeneration["attempt"]), 4) * 0.08)
+    return value
+
+
+def _ollama_context_window_for_messages(messages, output_tokens):
+    text = "\n".join(str(message.get("content", "")) for message in messages)
+    return _ollama_context_window(text, output_tokens)
+
+
+def _ollama_context_window(text, output_tokens=0):
+    # Model metadata often advertises 128K or 256K contexts. Letting Ollama use
+    # that value for a short autocomplete prompt can allocate a huge KV cache
+    # and force an otherwise small model partly onto the CPU. Estimate the
+    # actual prose prompt and round up to a modest power-of-two context instead.
+    text = str(text or "")
+    ascii_chars = sum(1 for char in text if ord(char) < 128)
+    non_ascii_chars = len(text) - ascii_chars
+    estimated_prompt_tokens = int(math.ceil(ascii_chars / 3.5 + non_ascii_chars / 1.5))
+    needed = estimated_prompt_tokens + max(0, int(output_tokens)) + OLLAMA_CONTEXT_RESERVE_TOKENS
+    context = OLLAMA_MIN_CONTEXT_TOKENS
+    while context < needed and context < OLLAMA_MAX_CONTEXT_TOKENS:
+        context *= 2
+    return min(context, OLLAMA_MAX_CONTEXT_TOKENS)
+
+
+def _ollama_guided_cache_key(settings):
+    host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/").lower()
+    model = str(settings.get("ollama_model") or "").strip().lower()
+    return host, model, _bool_setting(settings, "allow_reasoning")
+
+
+def _ollama_guided_is_unavailable(cache_key):
+    with _OLLAMA_GUIDED_LOCK:
+        return cache_key in _OLLAMA_GUIDED_UNAVAILABLE
+
+
+def _note_ollama_guided_success(cache_key):
+    with _OLLAMA_GUIDED_LOCK:
+        _OLLAMA_GUIDED_FAILURES.pop(cache_key, None)
+        _OLLAMA_GUIDED_UNAVAILABLE.discard(cache_key)
+
+
+def _note_ollama_guided_failure(cache_key, permanent=False):
+    with _OLLAMA_GUIDED_LOCK:
+        failures = _OLLAMA_GUIDED_FAILURES.get(cache_key, 0) + 1
+        _OLLAMA_GUIDED_FAILURES[cache_key] = failures
+        if permanent or failures >= OLLAMA_GUIDED_FAILURE_THRESHOLD:
+            _OLLAMA_GUIDED_UNAVAILABLE.add(cache_key)
+
+
+def _is_ollama_guided_unsupported(error):
+    if error.code not in (400, 404, 422):
+        return False
+    body = str(error.body or "").lower()
+    if error.code == 404 and "model" in body and "not found" in body:
+        return False
+    markers = ("format", "schema", "structured", "/api/chat", "not supported", "unsupported")
+    return error.code == 404 or any(marker in body for marker in markers)
 
 
 def _ollama_completion_prompt(prefix, suffix, settings):
@@ -604,9 +860,14 @@ def _request_ollama_messages(messages, settings, token_limit=None, temperature=N
         "messages": _ollama_messages_for_request(messages, settings),
         "stream": False,
         "think": _ollama_think_setting(settings),
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": _float_setting(settings, "temperature") if temperature is None else temperature,
             "num_predict": token_limit or _completion_token_limit(settings),
+            "num_ctx": _ollama_context_window_for_messages(
+                messages,
+                token_limit or _completion_token_limit(settings),
+            ),
         },
     }
     response = _post_json(host + "/api/chat", payload, {"Content-Type": "application/json"})
@@ -618,6 +879,9 @@ def _request_ollama_messages(messages, settings, token_limit=None, temperature=N
 
 
 def _ollama_think_setting(settings):
+    model = str(settings.get("ollama_model") or "").lower()
+    if "gpt-oss" in model:
+        return "medium" if _bool_setting(settings, "allow_reasoning") else "low"
     return True if _bool_setting(settings, "allow_reasoning") else False
 
 
@@ -749,6 +1013,10 @@ def _last_words(text, count):
     return text[matches[-count].start() :].lstrip()
 
 
+class _GuidedCompletionError(RuntimeError):
+    pass
+
+
 class _HttpJsonError(RuntimeError):
     def __init__(self, code, url, body):
         self.code = code
@@ -853,18 +1121,12 @@ def _get_text_context(doc, settings):
 
     text = view_cursor.getText()
 
-    # Anchor both ranges at the actual insertion point. In particular, never
-    # create the prefix from the document end: text after the cursor must not
-    # consume any of the before-cursor character budget.
+    # Anchor the range at the actual insertion point. Text after the cursor is
+    # neither extracted nor sent to the model: the cursor is a temporary EOF.
     prefix_cursor = text.createTextCursorByRange(view_cursor.getStart())
     _go_left(prefix_cursor, _prefix_char_budget(settings), True)
     prefix = prefix_cursor.getString()
-
-    suffix_cursor = text.createTextCursorByRange(view_cursor.getEnd())
-    _go_right(suffix_cursor, _int_setting(settings, "suffix_chars"), True)
-    suffix = suffix_cursor.getString()
-
-    return view_cursor, prefix, suffix
+    return view_cursor, prefix, ""
 
 
 def _prefix_char_budget(settings):
@@ -912,7 +1174,6 @@ class GhostCompletion:
         completion,
         original_properties,
         request_prefix=None,
-        request_suffix=None,
         regeneration_attempt=0,
     ):
         self.doc = doc
@@ -920,7 +1181,6 @@ class GhostCompletion:
         self.completion = completion
         self.original_properties = original_properties
         self.request_prefix = request_prefix
-        self.request_suffix = request_suffix
         self.regeneration_attempt = regeneration_attempt
 
     def matches_document(self):
@@ -1055,7 +1315,7 @@ def _reject_ghost(doc):
         return False
 
     ghost.discard()
-    if ghost.request_prefix is None or ghost.request_suffix is None:
+    if ghost.request_prefix is None:
         _REGENERATION_STATES.pop(key, None)
         return True
 
@@ -1064,7 +1324,6 @@ def _reject_ghost(doc):
     rejected.append(ghost.completion)
     _REGENERATION_STATES[key] = {
         "prefix": ghost.request_prefix,
-        "suffix": ghost.request_suffix,
         "attempt": ghost.regeneration_attempt + 1,
         "rejected": rejected[-MAX_REJECTED_COMPLETIONS:],
     }
@@ -1073,7 +1332,7 @@ def _reject_ghost(doc):
 
 def _regeneration_for_context(key, prefix, suffix):
     state = _REGENERATION_STATES.get(key)
-    if state and state.get("prefix") == prefix and state.get("suffix") == suffix:
+    if state and state.get("prefix") == prefix:
         return {
             "attempt": state.get("attempt", 0),
             "rejected": list(state.get("rejected", ())),
@@ -1087,7 +1346,6 @@ def _show_ghost_completion(
     view_cursor,
     completion,
     request_prefix=None,
-    request_suffix=None,
     regeneration_attempt=0,
 ):
     _discard_ghost(doc)
@@ -1107,7 +1365,6 @@ def _show_ghost_completion(
         completion,
         original_properties,
         request_prefix=request_prefix,
-        request_suffix=request_suffix,
         regeneration_attempt=regeneration_attempt,
     )
 
@@ -1213,7 +1470,6 @@ def complete_current_position(doc=None, preview=True, quiet=False):
                     view_cursor,
                     completion,
                     request_prefix=prefix,
-                    request_suffix=suffix,
                     regeneration_attempt=(regeneration or {}).get("attempt", 0),
                 )
             else:
@@ -1668,7 +1924,7 @@ def _create_settings_dialog(ctx, settings):
     model.PositionX = 80
     model.PositionY = 80
     model.Width = 285
-    model.Height = 312
+    model.Height = 330
     model.Title = "LibreCompleteAI Settings"
 
     y = 10
@@ -1698,6 +1954,17 @@ def _create_settings_dialog(ctx, settings):
     y += 18
     _label(model, "ollama_model_label", 10, y, 70, "Ollama model")
     _edit(model, "ollama_model", 88, y - 2, 175, settings.get("ollama_model", ""))
+
+    y += 18
+    _label(model, "ollama_mode_label", 10, y, 70, "Ollama mode")
+    _edit(
+        model,
+        "ollama_completion_mode",
+        88,
+        y - 2,
+        175,
+        settings.get("ollama_completion_mode", "auto"),
+    )
 
     y += 22
     _checkbox(
@@ -1738,10 +2005,6 @@ def _create_settings_dialog(ctx, settings):
     _edit(model, "prediction_words", 88, y - 2, 45, settings.get("prediction_words", ""))
     _slider(model, "prediction_words_slider", 143, y - 1, 120, settings, "prediction_words")
 
-    y += 18
-    _label(model, "suffix_label", 10, y, 70, "After chars")
-    _edit(model, "suffix_chars", 88, y - 2, 45, settings.get("suffix_chars", ""))
-
     y += 20
     _label(model, "guidance_label", 10, y, 70, "Writing guidance")
     guidance = _edit(model, "writing_guidance", 88, y - 2, 175, settings.get("writing_guidance", ""))
@@ -1749,8 +2012,8 @@ def _create_settings_dialog(ctx, settings):
     guidance.MultiLine = True
     guidance.VScroll = True
 
-    _button(model, "ok", 168, 288, 45, "OK", 1)
-    _button(model, "cancel", 218, 288, 45, "Cancel", 2)
+    _button(model, "ok", 168, 306, 45, "OK", 1)
+    _button(model, "cancel", 218, 306, 45, "Cancel", 2)
 
     dialog = smgr.createInstanceWithContext("com.sun.star.awt.UnoControlDialog", ctx)
     dialog.setModel(model)

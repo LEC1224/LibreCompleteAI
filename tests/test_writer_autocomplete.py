@@ -25,11 +25,14 @@ def load_options_handler():
 class WriterAutocompleteTests(unittest.TestCase):
     def test_normalize_settings_defaults_to_supported_provider(self):
         module = load_module()
-        settings = module.normalize_settings({"provider": "bad"})
+        settings = module.normalize_settings({"provider": "bad", "suffix_chars": "999"})
         self.assertEqual(settings["provider"], "openai")
+        self.assertNotIn("suffix_chars", settings)
         self.assertEqual(settings["openai_base_url"], "https://api.openai.com/v1")
         self.assertEqual(settings["continuous_suggestions"], "false")
         self.assertEqual(settings["allow_reasoning"], "false")
+        self.assertEqual(settings["ollama_model"], "qwen3.5:4b")
+        self.assertEqual(settings["ollama_completion_mode"], "auto")
         self.assertEqual(settings["max_context_words"], "600")
         self.assertEqual(settings["prediction_words"], "24")
 
@@ -60,18 +63,44 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(settings["temperature"], "0.45")
         self.assertEqual(module._prediction_words(settings), 50)
 
+    def test_normalize_settings_rejects_unknown_ollama_completion_mode(self):
+        module = load_module()
+        self.assertEqual(
+            module.normalize_settings({"ollama_completion_mode": "BAD"})["ollama_completion_mode"],
+            "auto",
+        )
+        self.assertEqual(
+            module.normalize_settings({"ollama_completion_mode": " Guided "})[
+                "ollama_completion_mode"
+            ],
+            "guided",
+        )
+
     def test_build_messages_is_insert_only(self):
         module = load_module()
         settings = module.normalize_settings({"provider": "ollama", "max_tokens": "40", "prediction_words": "7"})
-        messages = module.build_messages("The room was quiet", "afterward.", settings)
+        messages = module.build_messages("The room was quiet", "", settings)
         joined = "\n".join(message["content"] for message in messages)
         self.assertIn("Return only text", joined)
         self.assertIn("The room was quiet", joined)
-        self.assertIn("afterward.", joined)
         self.assertIn("Aim for 7 words", joined)
         self.assertIn("use 5-7 words", joined)
         self.assertIn("Never exceed 7 words", joined)
         self.assertIn("Do not reason", joined)
+
+    def test_build_messages_ignores_after_cursor_text(self):
+        module = load_module()
+        settings = module.normalize_settings({"prediction_words": "100"})
+        messages = module.build_messages(
+            "The dragon's wings flattened the grass around him.",
+            "Elian's heart hammered as the dragon landed.",
+            settings,
+        )
+        joined = "\n".join(message["content"] for message in messages)
+        self.assertIn("Treat <cursor> as the current end of the document", joined)
+        self.assertIn("use 80-100 words", joined)
+        self.assertNotIn("Elian's heart hammered as the dragon landed.", joined)
+        self.assertNotIn("<after>", joined)
 
     def test_completion_token_limit_tracks_prediction_words_below_hard_cap(self):
         module = load_module()
@@ -162,9 +191,7 @@ class WriterAutocompleteTests(unittest.TestCase):
         text = Text("0123456789abcdefghij")
         doc = Doc()
         doc.view_cursor = Range(text, 10)
-        settings = module.normalize_settings(
-            {"max_context_words": "0", "prefix_chars": "4", "suffix_chars": "5"}
-        )
+        settings = module.normalize_settings({"max_context_words": "0", "prefix_chars": "4"})
         original_view_cursor = module._view_cursor
         module._view_cursor = lambda current_doc: current_doc.view_cursor
         try:
@@ -173,7 +200,7 @@ class WriterAutocompleteTests(unittest.TestCase):
             module._view_cursor = original_view_cursor
 
         self.assertEqual(prefix, "6789")
-        self.assertEqual(suffix, "abcde")
+        self.assertEqual(suffix, "")
         self.assertNotIn("abcdefghij", prefix)
 
     def test_escape_regeneration_changes_direction_without_shrinking_target(self):
@@ -209,7 +236,6 @@ class WriterAutocompleteTests(unittest.TestCase):
                 " first rejected direction",
                 {},
                 request_prefix="Before cursor",
-                request_suffix="After cursor",
                 regeneration_attempt=0,
             )
             module._GHOSTS[key] = first
@@ -222,7 +248,6 @@ class WriterAutocompleteTests(unittest.TestCase):
                 " second rejected direction",
                 {},
                 request_prefix="Before cursor",
-                request_suffix="After cursor",
                 regeneration_attempt=regeneration["attempt"],
             )
             module._GHOSTS[key] = second
@@ -248,7 +273,7 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIn("first rejected direction", prompt)
         self.assertIn("second rejected direction", prompt)
         self.assertIn("Keep the requested length near 40 words", prompt)
-        self.assertIn("Aim for 40 words", prompt)
+        self.assertIn("do not shorten it merely because this is a retry", prompt)
         self.assertEqual(module._completion_token_limit(settings), 80)
 
     def test_regeneration_state_resets_when_cursor_context_changes(self):
@@ -256,7 +281,6 @@ class WriterAutocompleteTests(unittest.TestCase):
         key = "retry-context-change"
         module._REGENERATION_STATES[key] = {
             "prefix": "original prefix",
-            "suffix": "original suffix",
             "attempt": 2,
             "rejected": ["one", "two"],
         }
@@ -265,6 +289,52 @@ class WriterAutocompleteTests(unittest.TestCase):
             self.assertNotIn(key, module._REGENERATION_STATES)
         finally:
             module._REGENERATION_STATES.pop(key, None)
+
+    def test_empty_manual_completion_reports_no_useful_continuation(self):
+        module = load_module()
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "quiet-seam-document"
+
+        class Status:
+            def start(self, *args):
+                pass
+
+            def end(self):
+                pass
+
+        doc = Doc()
+        messages = []
+        originals = {
+            "_is_writer_document": module._is_writer_document,
+            "_has_ghost": module._has_ghost,
+            "load_settings": module.load_settings,
+            "_status_indicator": module._status_indicator,
+            "_get_text_context": module._get_text_context,
+            "request_completion": module.request_completion,
+            "_message_box": module._message_box,
+        }
+        module._is_writer_document = lambda current_doc: True
+        module._has_ghost = lambda current_doc: False
+        module.load_settings = lambda: module.normalize_settings({})
+        module._status_indicator = lambda current_doc: Status()
+        module._get_text_context = lambda current_doc, settings: (
+            object(),
+            "before",
+            "existing after",
+        )
+        module.request_completion = lambda *args, **kwargs: ""
+        module._message_box = lambda *args: messages.append(args)
+        try:
+            module.complete_current_position(doc, preview=True, quiet=False)
+        finally:
+            for name, value in originals.items():
+                setattr(module, name, value)
+            module._BUSY_DOCS.discard("quiet-seam-document")
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0][-1], "The model did not return a useful continuation.")
 
     def test_discard_ghost_restores_insertion_properties(self):
         module = load_module()
@@ -756,7 +826,13 @@ class WriterAutocompleteTests(unittest.TestCase):
         original = module._post_json
         module._post_json = fake_post_json
         try:
-            settings = module.normalize_settings({"provider": "ollama", "ollama_model": "qwen3"})
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_model": "qwen3",
+                    "ollama_completion_mode": "raw",
+                }
+            )
             self.assertEqual(module._request_ollama("before", "after", settings), "the next line")
         finally:
             module._post_json = original
@@ -764,7 +840,9 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertTrue(calls[0][0].endswith("/api/generate"))
         self.assertIs(calls[0][1]["raw"], True)
         self.assertIs(calls[0][1]["think"], False)
+        self.assertEqual(calls[0][1]["keep_alive"], "30m")
         self.assertEqual(calls[0][1]["prompt"], "before")
+        self.assertEqual(calls[0][1]["options"]["num_ctx"], 2048)
         self.assertIn("Okay, let me", calls[0][1]["options"]["stop"])
         self.assertNotIn("\n\n", calls[0][1]["options"]["stop"])
 
@@ -786,6 +864,7 @@ class WriterAutocompleteTests(unittest.TestCase):
             module._post_json = original
 
         self.assertTrue(calls[0][0].endswith("/api/chat"))
+        self.assertEqual(calls[0][1]["keep_alive"], "30m")
         user_messages = [message for message in calls[0][1]["messages"] if message["role"] == "user"]
         self.assertTrue(user_messages)
         self.assertTrue(user_messages[0]["content"].rstrip().endswith("/no_think"))
@@ -802,7 +881,12 @@ class WriterAutocompleteTests(unittest.TestCase):
         module._post_json = fake_post_json
         try:
             settings = module.normalize_settings(
-                {"provider": "ollama", "ollama_model": "qwen3", "allow_reasoning": "true"}
+                {
+                    "provider": "ollama",
+                    "ollama_model": "qwen3",
+                    "allow_reasoning": "true",
+                    "ollama_completion_mode": "raw",
+                }
             )
             self.assertEqual(module._request_ollama("before", "after", settings), "the next line")
         finally:
@@ -830,6 +914,7 @@ class WriterAutocompleteTests(unittest.TestCase):
                     "temperature": "0.45",
                     "prediction_words": "40",
                     "max_tokens": "96",
+                    "ollama_completion_mode": "raw",
                 }
             )
             module.request_completion(
@@ -843,6 +928,298 @@ class WriterAutocompleteTests(unittest.TestCase):
 
         self.assertAlmostEqual(calls[0]["options"]["temperature"], 0.61)
         self.assertEqual(calls[0]["options"]["num_predict"], 80)
+
+    def test_ollama_guided_mode_uses_schema_and_ignores_suffix(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append((url, payload, headers))
+            return {
+                "message": {
+                    "content": '{"completion":" the next seven useful words arrive right here"}'
+                }
+            }
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_model": "qwen3.5:4b",
+                    "ollama_completion_mode": "guided",
+                    "prediction_words": "7",
+                    "max_tokens": "40",
+                }
+            )
+            completion = module.request_completion("Before cursor", "After cursor", settings)
+        finally:
+            module._post_json = original
+
+        self.assertEqual(completion, " the next seven useful words arrive right")
+        self.assertEqual(len(calls), 1)
+        url, payload, _headers = calls[0]
+        self.assertTrue(url.endswith("/api/chat"))
+        self.assertEqual(payload["format"], module.OLLAMA_COMPLETION_SCHEMA)
+        self.assertEqual(payload["keep_alive"], "30m")
+        self.assertIs(payload["think"], False)
+        self.assertEqual(payload["options"]["num_predict"], 26)
+        self.assertEqual(payload["options"]["num_ctx"], 2048)
+        joined = "\n".join(message["content"] for message in payload["messages"])
+        self.assertIn("Before cursor", joined)
+        self.assertNotIn("After cursor", joined)
+        self.assertIn("current end of the document", joined)
+        self.assertIn('"completion"', joined)
+        self.assertTrue(joined.rstrip().endswith("/no_think"))
+
+    def test_ollama_auto_falls_back_from_meta_completion_to_raw(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(url)
+            if url.endswith("/api/chat"):
+                return {
+                    "message": {
+                        "content": '{"completion":"Okay, let me inspect what the user wants at the cursor."}'
+                    }
+                }
+            return {"response": " a clean raw continuation"}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_model": "weak-chat-model",
+                    "ollama_completion_mode": "auto",
+                }
+            )
+            completion = module.request_completion("before", "", settings)
+        finally:
+            module._post_json = original
+
+        self.assertEqual(completion, " a clean raw continuation")
+        self.assertEqual(
+            calls,
+            ["http://localhost:11434/api/chat", "http://localhost:11434/api/generate"],
+        )
+
+    def test_ollama_auto_caches_raw_after_repeated_guided_failures(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(url)
+            if url.endswith("/api/chat"):
+                return {"message": {"content": "not json"}}
+            return {"response": " raw fallback"}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_model": "invalid-json-model",
+                    "ollama_completion_mode": "auto",
+                }
+            )
+            self.assertEqual(module.request_completion("before", "", settings), " raw fallback")
+            self.assertEqual(module.request_completion("before", "", settings), " raw fallback")
+            self.assertEqual(module.request_completion("before", "", settings), " raw fallback")
+        finally:
+            module._post_json = original
+
+        self.assertEqual(
+            calls,
+            [
+                "http://localhost:11434/api/chat",
+                "http://localhost:11434/api/generate",
+                "http://localhost:11434/api/chat",
+                "http://localhost:11434/api/generate",
+                "http://localhost:11434/api/generate",
+            ],
+        )
+
+    def test_ollama_auto_immediately_caches_unsupported_structured_output(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(url)
+            if url.endswith("/api/chat"):
+                raise module._HttpJsonError(
+                    400,
+                    url,
+                    '{"error":"structured format is not supported"}',
+                )
+            return {"response": " raw compatibility path"}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_model": "legacy-model",
+                    "ollama_completion_mode": "auto",
+                }
+            )
+            self.assertEqual(
+                module.request_completion("before", "", settings),
+                " raw compatibility path",
+            )
+            self.assertEqual(
+                module.request_completion("before", "", settings),
+                " raw compatibility path",
+            )
+        finally:
+            module._post_json = original
+
+        self.assertEqual(
+            calls,
+            [
+                "http://localhost:11434/api/chat",
+                "http://localhost:11434/api/generate",
+                "http://localhost:11434/api/generate",
+            ],
+        )
+
+    def test_ollama_auto_uses_raw_fallback_even_with_text_after_cursor(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(url)
+            if url.endswith("/api/chat"):
+                return {"message": {"content": "not json"}}
+            return {"response": " forward continuation"}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_model": "bad-at-structured-output",
+                    "ollama_completion_mode": "auto",
+                }
+            )
+            self.assertEqual(
+                module.request_completion("before", "existing after", settings),
+                " forward continuation",
+            )
+        finally:
+            module._post_json = original
+
+        self.assertEqual(
+            calls,
+            [
+                "http://localhost:11434/api/chat",
+                "http://localhost:11434/api/generate",
+            ],
+        )
+
+    def test_ollama_guided_empty_completion_is_single_pass(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(url)
+            return {"message": {"content": '{"completion":""}'}}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {"provider": "ollama", "ollama_completion_mode": "guided"}
+            )
+            self.assertEqual(module.request_completion("before", "existing after", settings), "")
+        finally:
+            module._post_json = original
+
+        self.assertEqual(
+            calls,
+            ["http://localhost:11434/api/chat"],
+        )
+
+    def test_ollama_guided_mode_does_not_silently_fallback(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(url)
+            return {"message": {"content": "not json"}}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_completion_mode": "guided",
+                }
+            )
+            with self.assertRaises(module._GuidedCompletionError):
+                module.request_completion("before", "after", settings)
+        finally:
+            module._post_json = original
+
+        self.assertEqual(calls, ["http://localhost:11434/api/chat"])
+
+    def test_ollama_gpt_oss_uses_supported_thinking_levels(self):
+        module = load_module()
+        disabled = module.normalize_settings({"ollama_model": "gpt-oss:20b"})
+        allowed = module.normalize_settings(
+            {"ollama_model": "gpt-oss:20b", "allow_reasoning": "true"}
+        )
+        self.assertEqual(module._ollama_think_setting(disabled), "low")
+        self.assertEqual(module._ollama_think_setting(allowed), "medium")
+
+    def test_ollama_context_window_scales_without_using_model_maximum(self):
+        module = load_module()
+        self.assertEqual(module._ollama_context_window("short prompt", 80), 2048)
+        self.assertEqual(module._ollama_context_window("a" * 12000, 100), 4096)
+        self.assertEqual(module._ollama_context_window("a" * 30000, 100), 16384)
+        self.assertEqual(module._ollama_context_window("å" * 50000, 100), 16384)
+
+    def test_openai_completion_ignores_text_after_cursor(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(payload)
+            return {
+                "choices": [
+                    {"message": {"content": "The dragon landed and spoke to Elian."}}
+                ]
+            }
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "openai",
+                    "openai_api_key": "sk-test",
+                    "openai_model": "gpt-5.4-mini",
+                }
+            )
+            completion = module.request_completion(
+                "Wings thundered above Elian.",
+                "The dragon landed and fixed its gaze on him.",
+                settings,
+            )
+        finally:
+            module._post_json = original
+
+        self.assertEqual(completion, "The dragon landed and spoke to Elian.")
+        self.assertEqual(len(calls), 1)
+        joined = "\n".join(message["content"] for message in calls[0]["messages"])
+        self.assertNotIn("The dragon landed and fixed its gaze on him.", joined)
 
     def test_clean_completion_strips_labels_and_fences(self):
         module = load_module()
@@ -882,6 +1259,15 @@ class WriterAutocompleteTests(unittest.TestCase):
         prefix = "She opened the notebook and wrote"
         completion = "notebook and wrote one sentence before stopping."
         self.assertEqual(module.clean_completion(completion, prefix), " one sentence before stopping.")
+
+    def test_clean_completion_does_not_remove_single_word_echo_into_fragment(self):
+        module = load_module()
+        prefix = "It was no ordinary creature"
+        completion = "creature of ancient mind and voice."
+        self.assertEqual(
+            module.clean_completion(completion, prefix),
+            "creature of ancient mind and voice.",
+        )
 
     def test_completion_spacing_adds_missing_space_after_word(self):
         module = load_module()

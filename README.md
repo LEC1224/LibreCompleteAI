@@ -80,17 +80,26 @@ For Ollama use, set:
 
 - Provider: `Ollama`
 - Host, usually `http://localhost:11434`
-- Model label, matching a local model from `ollama list`
+- Model label, matching a local model from `ollama list`. `qwen3.5:4b` is the default and a good responsive starting point for GPUs with roughly 6–10 GB of available VRAM.
+- Ollama mode: `auto` (recommended), `guided`, or `raw`.
 
 Generation controls:
 
 - `Continuous autocomplete suggestions`: request suggestions in the background after you type a few new words. If you keep typing while the model thinks, LibreCompleteAI only shows the remaining ghost text when your typed words match the returned suggestion; otherwise it discards the stale suggestion and asks again from the new cursor context.
-- `Allow reasoning`: off by default. When off, LibreCompleteAI asks supported providers to avoid reasoning (`think: false` for Ollama, Qwen3 `/no_think` where applicable, and the lowest reasoning effort supported by OpenAI-compatible chat completions) and strips visible thinking or meta-commentary if a model returns it anyway.
+- `Allow reasoning`: off by default. When off, LibreCompleteAI asks supported providers to avoid reasoning (`think: false` for most Ollama models, Qwen3 `/no_think` where applicable, GPT-OSS `low`, and the lowest reasoning effort supported by OpenAI-compatible chat completions) and strips visible thinking or meta-commentary if a model returns it anyway.
 - `Context words`: how many words before the cursor should guide suggestions. Older text is compressed with the selected LLM when the context grows beyond this budget.
-- `Prediction words`: the target length for each suggestion. The model is asked to stay near the target, and returned text is always capped at this many words.
-- `Token cap`: the hard output token limit sent to OpenAI-compatible APIs or Ollama.
+- `Prediction words`: the target suggestion length and hard maximum, wherever the cursor is in the document.
+- `Token cap`: the semantic output budget. Guided Ollama requests add a small internal allowance for their JSON envelope; extracted document text is still capped at the configured prediction-word count.
 
-For Ollama, inline completions use the plain `/api/generate` endpoint with raw document text so local models continue the prose instead of answering a chat task. Long-context summaries still use Ollama chat.
+Ollama completion modes:
+
+- `auto`: sends an OpenAI-like guided chat request with before-cursor context, writing guidance, retry directions, disabled thinking, and a JSON schema containing only the completion. The extracted text still passes through the meta-response, prefix-echo, and length filters. If a model rejects structured output or returns invalid/meta text, LC-AI retries through raw continuation. After two guided failures from the same host/model, raw mode is cached for later requests during that LibreOffice session.
+- `guided`: always uses schema-constrained chat and reports a failure instead of silently switching modes. This is useful for testing whether a model follows the stronger contract.
+- `raw`: always uses the original plain `/api/generate` continuation behavior. It is the compatibility option for models that produce better prose from an unadorned prefix.
+
+Ollama models are kept loaded for 30 minutes after a request to avoid repeated cold-start delays during an active writing session. LC-AI also sizes Ollama's runtime context window from the actual prompt (between 2K and 16K tokens) instead of blindly allocating a model's advertised 128K/256K maximum; this helps small models remain fully GPU-resident. Long-context summaries continue to use Ollama chat.
+
+Autocomplete always treats the cursor as the temporary end of the document. Already-written text after the cursor is neither extracted nor sent to the model, so a mid-document request behaves like an end-of-document continuation. The writer can decide how and whether to connect the generated passage to the later text.
 
 API keys are stored locally in plain text in the user's configuration directory.
 
@@ -104,7 +113,7 @@ In Writer, use the `LC-AI` button on the LibreCompleteAI toolbar, or choose:
 Tools > Add-ons > Toggle LibreCompleteAI
 ```
 
-The `LC-AI` button stays pressed while LibreCompleteAI is enabled for the current Writer window. The secondary toolbar buttons are available only while LC-AI is enabled. Then press Tab while the cursor is in document text. The extension sends a small amount of text before and after the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
+The `LC-AI` button stays pressed while LibreCompleteAI is enabled for the current Writer window. The secondary toolbar buttons are available only while LC-AI is enabled. Then press Tab while the cursor is in document text. The extension sends a small amount of text before the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
 
 For automatic background suggestions, use the `Continuous` toolbar button, or choose:
 

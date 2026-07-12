@@ -61,7 +61,8 @@ DEFAULT_SETTINGS = {
     "openai_base_url": "https://api.openai.com/v1",
     "openai_model": "gpt-4.1-mini",
     "ollama_host": "http://localhost:11434",
-    "ollama_model": "llama3.2",
+    "ollama_model": "qwen3.5:4b",
+    "ollama_completion_mode": "auto",
     "temperature": "0.45",
     "max_tokens": "96",
     "prediction_words": "24",
@@ -69,7 +70,6 @@ DEFAULT_SETTINGS = {
     "allow_reasoning": "false",
     "max_context_words": "600",
     "prefix_chars": "2400",
-    "suffix_chars": "600",
     "writing_guidance": "Match the author's language, tone, point of view, and pacing.",
 }
 SETTINGS_FIELDS = (
@@ -79,6 +79,7 @@ SETTINGS_FIELDS = (
     "openai_model",
     "ollama_host",
     "ollama_model",
+    "ollama_completion_mode",
     "temperature",
     "max_tokens",
     "prediction_words",
@@ -86,7 +87,6 @@ SETTINGS_FIELDS = (
     "allow_reasoning",
     "max_context_words",
     "prefix_chars",
-    "suffix_chars",
     "writing_guidance",
 )
 INTEGER_SETTINGS = (
@@ -94,13 +94,13 @@ INTEGER_SETTINGS = (
     "prediction_words",
     "max_context_words",
     "prefix_chars",
-    "suffix_chars",
 )
 BOOLEAN_SETTINGS = ("continuous_suggestions", "allow_reasoning")
 SLIDER_SETTINGS = {
     "max_context_words": "max_context_words_slider",
     "prediction_words": "prediction_words_slider",
 }
+OLLAMA_COMPLETION_MODES = ("auto", "guided", "raw")
 
 
 def _config_dir():
@@ -120,11 +120,18 @@ def normalize_settings(settings):
     merged = dict(DEFAULT_SETTINGS)
     if settings:
         merged.update(settings)
+    # Remove the retired after-cursor setting from older saved configurations.
+    merged.pop("suffix_chars", None)
 
     provider = str(merged.get("provider", "openai")).strip().lower()
     if provider not in ("openai", "ollama"):
         provider = "openai"
     merged["provider"] = provider
+
+    ollama_mode = str(merged.get("ollama_completion_mode", "auto")).strip().lower()
+    if ollama_mode not in OLLAMA_COMPLETION_MODES:
+        ollama_mode = "auto"
+    merged["ollama_completion_mode"] = ollama_mode
 
     for key in SETTINGS_FIELDS:
         merged[key] = str(merged.get(key, DEFAULT_SETTINGS[key])).strip()

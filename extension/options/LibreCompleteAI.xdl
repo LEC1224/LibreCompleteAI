@@ -7,7 +7,7 @@
   dlg:left="80"
   dlg:top="60"
   dlg:width="270"
-  dlg:height="268"
+  dlg:height="284"
   dlg:closeable="true"
   dlg:moveable="true"
   dlg:withtitlebar="false">
@@ -28,28 +28,27 @@
     <dlg:textfield dlg:id="ollama_host" dlg:tab-index="11" dlg:left="84" dlg:top="98" dlg:width="176" dlg:height="12"/>
     <dlg:text dlg:id="ollama_model_label" dlg:tab-index="12" dlg:left="6" dlg:top="116" dlg:width="74" dlg:height="8" dlg:value="Model"/>
     <dlg:textfield dlg:id="ollama_model" dlg:tab-index="13" dlg:left="84" dlg:top="114" dlg:width="176" dlg:height="12"/>
+    <dlg:text dlg:id="ollama_completion_mode_label" dlg:tab-index="14" dlg:left="6" dlg:top="132" dlg:width="74" dlg:height="8" dlg:value="Mode"/>
+    <dlg:textfield dlg:id="ollama_completion_mode" dlg:tab-index="15" dlg:left="84" dlg:top="130" dlg:width="176" dlg:height="12" dlg:value="auto" dlg:help-text="Use auto, guided, or raw."/>
 
-    <dlg:fixedline dlg:id="generation_line" dlg:tab-index="14" dlg:left="6" dlg:top="132" dlg:width="254" dlg:height="8" dlg:value="Generation"/>
-    <dlg:checkbox dlg:id="continuous_suggestions" dlg:tab-index="15" dlg:left="6" dlg:top="144" dlg:width="214" dlg:height="10" dlg:value="Continuous autocomplete suggestions" dlg:checked="false"/>
-    <dlg:checkbox dlg:id="allow_reasoning" dlg:tab-index="16" dlg:left="6" dlg:top="158" dlg:width="214" dlg:height="10" dlg:value="Allow reasoning" dlg:checked="false"/>
+    <dlg:fixedline dlg:id="generation_line" dlg:tab-index="16" dlg:left="6" dlg:top="148" dlg:width="254" dlg:height="8" dlg:value="Generation"/>
+    <dlg:checkbox dlg:id="continuous_suggestions" dlg:tab-index="17" dlg:left="6" dlg:top="160" dlg:width="214" dlg:height="10" dlg:value="Continuous autocomplete suggestions" dlg:checked="false"/>
+    <dlg:checkbox dlg:id="allow_reasoning" dlg:tab-index="18" dlg:left="6" dlg:top="174" dlg:width="214" dlg:height="10" dlg:value="Allow reasoning" dlg:checked="false"/>
 
-    <dlg:text dlg:id="temperature_label" dlg:tab-index="17" dlg:left="6" dlg:top="176" dlg:width="74" dlg:height="8" dlg:value="Temperature"/>
-    <dlg:textfield dlg:id="temperature" dlg:tab-index="18" dlg:left="84" dlg:top="174" dlg:width="40" dlg:height="12"/>
-    <dlg:text dlg:id="max_tokens_label" dlg:tab-index="19" dlg:left="134" dlg:top="176" dlg:width="54" dlg:height="8" dlg:value="Token cap"/>
-    <dlg:textfield dlg:id="max_tokens" dlg:tab-index="20" dlg:left="194" dlg:top="174" dlg:width="66" dlg:height="12"/>
+    <dlg:text dlg:id="temperature_label" dlg:tab-index="19" dlg:left="6" dlg:top="192" dlg:width="74" dlg:height="8" dlg:value="Temperature"/>
+    <dlg:textfield dlg:id="temperature" dlg:tab-index="20" dlg:left="84" dlg:top="190" dlg:width="40" dlg:height="12"/>
+    <dlg:text dlg:id="max_tokens_label" dlg:tab-index="21" dlg:left="134" dlg:top="192" dlg:width="54" dlg:height="8" dlg:value="Token cap"/>
+    <dlg:textfield dlg:id="max_tokens" dlg:tab-index="22" dlg:left="194" dlg:top="190" dlg:width="66" dlg:height="12"/>
 
-    <dlg:text dlg:id="max_context_words_label" dlg:tab-index="21" dlg:left="6" dlg:top="192" dlg:width="74" dlg:height="8" dlg:value="Context words"/>
-    <dlg:numericfield dlg:id="max_context_words" dlg:tab-index="22" dlg:left="84" dlg:top="190" dlg:width="40" dlg:height="12" dlg:value="600" dlg:value-min="100" dlg:value-max="4000" dlg:value-step="100" dlg:spin="true"/>
-    <dlg:scrollbar dlg:id="max_context_words_slider" dlg:tab-index="23" dlg:left="134" dlg:top="192" dlg:width="126" dlg:height="8" dlg:align="horizontal" dlg:curpos="600" dlg:minpos="100" dlg:maxpos="4000" dlg:increment="100" dlg:pageincrement="500" dlg:visible-size="100" dlg:live-scroll="true"/>
+    <dlg:text dlg:id="max_context_words_label" dlg:tab-index="23" dlg:left="6" dlg:top="208" dlg:width="74" dlg:height="8" dlg:value="Context words"/>
+    <dlg:numericfield dlg:id="max_context_words" dlg:tab-index="24" dlg:left="84" dlg:top="206" dlg:width="40" dlg:height="12" dlg:value="600" dlg:value-min="100" dlg:value-max="4000" dlg:value-step="100" dlg:spin="true"/>
+    <dlg:scrollbar dlg:id="max_context_words_slider" dlg:tab-index="25" dlg:left="134" dlg:top="208" dlg:width="126" dlg:height="8" dlg:align="horizontal" dlg:curpos="600" dlg:minpos="100" dlg:maxpos="4000" dlg:increment="100" dlg:pageincrement="500" dlg:visible-size="100" dlg:live-scroll="true"/>
 
-    <dlg:text dlg:id="prediction_words_label" dlg:tab-index="24" dlg:left="6" dlg:top="208" dlg:width="74" dlg:height="8" dlg:value="Prediction words"/>
-    <dlg:numericfield dlg:id="prediction_words" dlg:tab-index="25" dlg:left="84" dlg:top="206" dlg:width="40" dlg:height="12" dlg:value="24" dlg:value-min="3" dlg:value-max="120" dlg:value-step="1" dlg:spin="true"/>
-    <dlg:scrollbar dlg:id="prediction_words_slider" dlg:tab-index="26" dlg:left="134" dlg:top="208" dlg:width="126" dlg:height="8" dlg:align="horizontal" dlg:curpos="24" dlg:minpos="3" dlg:maxpos="120" dlg:increment="1" dlg:pageincrement="10" dlg:visible-size="1" dlg:live-scroll="true"/>
-
-    <dlg:text dlg:id="suffix_chars_label" dlg:tab-index="27" dlg:left="6" dlg:top="224" dlg:width="74" dlg:height="8" dlg:value="After chars"/>
-    <dlg:textfield dlg:id="suffix_chars" dlg:tab-index="28" dlg:left="84" dlg:top="222" dlg:width="40" dlg:height="12"/>
+    <dlg:text dlg:id="prediction_words_label" dlg:tab-index="26" dlg:left="6" dlg:top="224" dlg:width="74" dlg:height="8" dlg:value="Prediction words"/>
+    <dlg:numericfield dlg:id="prediction_words" dlg:tab-index="27" dlg:left="84" dlg:top="222" dlg:width="40" dlg:height="12" dlg:value="24" dlg:value-min="3" dlg:value-max="120" dlg:value-step="1" dlg:spin="true"/>
+    <dlg:scrollbar dlg:id="prediction_words_slider" dlg:tab-index="28" dlg:left="134" dlg:top="224" dlg:width="126" dlg:height="8" dlg:align="horizontal" dlg:curpos="24" dlg:minpos="3" dlg:maxpos="120" dlg:increment="1" dlg:pageincrement="10" dlg:visible-size="1" dlg:live-scroll="true"/>
 
     <dlg:text dlg:id="writing_guidance_label" dlg:tab-index="29" dlg:left="6" dlg:top="240" dlg:width="74" dlg:height="8" dlg:value="Guidance"/>
-    <dlg:textfield dlg:id="writing_guidance" dlg:tab-index="30" dlg:left="84" dlg:top="238" dlg:width="176" dlg:height="24" dlg:multiline="true" dlg:vscroll="true"/>
+    <dlg:textfield dlg:id="writing_guidance" dlg:tab-index="30" dlg:left="84" dlg:top="238" dlg:width="176" dlg:height="40" dlg:multiline="true" dlg:vscroll="true"/>
   </dlg:bulletinboard>
 </dlg:window>
