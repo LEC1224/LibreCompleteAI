@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import math
 import os
 
 try:
@@ -88,6 +89,13 @@ SETTINGS_FIELDS = (
     "suffix_chars",
     "writing_guidance",
 )
+INTEGER_SETTINGS = (
+    "max_tokens",
+    "prediction_words",
+    "max_context_words",
+    "prefix_chars",
+    "suffix_chars",
+)
 BOOLEAN_SETTINGS = ("continuous_suggestions", "allow_reasoning")
 SLIDER_SETTINGS = {
     "max_context_words": "max_context_words_slider",
@@ -121,7 +129,45 @@ def normalize_settings(settings):
     for key in SETTINGS_FIELDS:
         merged[key] = str(merged.get(key, DEFAULT_SETTINGS[key])).strip()
 
+    for key in INTEGER_SETTINGS:
+        merged[key] = str(_parse_integer(merged[key], DEFAULT_SETTINGS[key]))
+    merged["temperature"] = _format_number(
+        _parse_localized_number(merged["temperature"], DEFAULT_SETTINGS["temperature"])
+    )
+
     return merged
+
+
+def _parse_integer(value, default):
+    return max(0, int(_parse_localized_number(value, default)))
+
+
+def _parse_localized_number(value, default):
+    """Parse values emitted by LibreOffice in the user's numeric locale."""
+    text = str(value).strip().replace("\u00a0", "").replace("\u202f", "").replace(" ", "")
+    if not text:
+        text = str(default)
+
+    if "," in text and "." in text:
+        decimal_separator = "," if text.rfind(",") > text.rfind(".") else "."
+        grouping_separator = "." if decimal_separator == "," else ","
+        text = text.replace(grouping_separator, "")
+        if decimal_separator == ",":
+            text = text.replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
+
+    try:
+        number = float(text)
+    except Exception:
+        number = float(str(default).replace(",", "."))
+    if not math.isfinite(number):
+        number = float(str(default).replace(",", "."))
+    return number
+
+
+def _format_number(value):
+    return format(value, ".15g")
 
 
 def load_settings():

@@ -60,6 +60,19 @@ class OptionsHandlerTests(unittest.TestCase):
             else:
                 os.environ["OPENAI_API_KEY"] = original
 
+    def test_normalize_settings_canonicalizes_localized_numeric_fields(self):
+        module = load_module()
+        settings = module.normalize_settings(
+            {
+                "prediction_words": "50,00",
+                "max_context_words": "1.200,00",
+                "temperature": "0,45",
+            }
+        )
+        self.assertEqual(settings["prediction_words"], "50")
+        self.assertEqual(settings["max_context_words"], "1200")
+        self.assertEqual(settings["temperature"], "0.45")
+
     def test_checkbox_helpers_roundtrip_boolean_strings(self):
         module = load_module()
 

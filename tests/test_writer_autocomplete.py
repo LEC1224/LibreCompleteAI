@@ -46,6 +46,20 @@ class WriterAutocompleteTests(unittest.TestCase):
             else:
                 os.environ["OPENAI_API_KEY"] = original
 
+    def test_normalize_settings_accepts_libreoffice_decimal_commas(self):
+        module = load_module()
+        settings = module.normalize_settings(
+            {
+                "prediction_words": "50,00",
+                "max_context_words": "1.200,00",
+                "temperature": "0,45",
+            }
+        )
+        self.assertEqual(settings["prediction_words"], "50")
+        self.assertEqual(settings["max_context_words"], "1200")
+        self.assertEqual(settings["temperature"], "0.45")
+        self.assertEqual(module._prediction_words(settings), 50)
+
     def test_build_messages_is_insert_only(self):
         module = load_module()
         settings = module.normalize_settings({"provider": "ollama", "max_tokens": "40", "prediction_words": "7"})
@@ -54,8 +68,20 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIn("Return only text", joined)
         self.assertIn("The room was quiet", joined)
         self.assertIn("afterward.", joined)
-        self.assertIn("Use 7 words", joined)
+        self.assertIn("Aim for 7 words", joined)
+        self.assertIn("use 5-7 words", joined)
+        self.assertIn("Never exceed 7 words", joined)
         self.assertIn("Do not reason", joined)
+
+    def test_completion_token_limit_tracks_prediction_words_below_hard_cap(self):
+        module = load_module()
+        short = module.normalize_settings({"prediction_words": "7", "max_tokens": "100"})
+        long = module.normalize_settings({"prediction_words": "50,00", "max_tokens": "100"})
+        capped = module.normalize_settings({"prediction_words": "120", "max_tokens": "64"})
+
+        self.assertEqual(module._completion_token_limit(short), 14)
+        self.assertEqual(module._completion_token_limit(long), 100)
+        self.assertEqual(module._completion_token_limit(capped), 64)
 
     def test_context_compression_summarizes_older_context(self):
         module = load_module()
@@ -78,6 +104,167 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIn("Earlier summary.", compressed)
         self.assertIn("word149", compressed)
         self.assertTrue(calls)
+
+    def test_text_context_counts_backward_from_cursor_not_document_end(self):
+        module = load_module()
+
+        class Text:
+            def __init__(self, value):
+                self.value = value
+
+            def createTextCursorByRange(self, text_range):
+                return Range(self, text_range.start, text_range.end)
+
+        class Range:
+            def __init__(self, text, start, end=None):
+                self.text = text
+                self.start = start
+                self.end = start if end is None else end
+
+            def isCollapsed(self):
+                return self.start == self.end
+
+            def getText(self):
+                return self.text
+
+            def getStart(self):
+                return Range(self.text, self.start)
+
+            def getEnd(self):
+                return Range(self.text, self.end)
+
+            def getString(self):
+                return self.text.value[self.start : self.end]
+
+            def goLeft(self, count, expand):
+                destination = max(0, self.start - count)
+                moved_all = self.start - destination == count
+                if expand:
+                    self.start = destination
+                else:
+                    self.start = destination
+                    self.end = destination
+                return moved_all
+
+            def goRight(self, count, expand):
+                destination = min(len(self.text.value), self.end + count)
+                moved_all = destination - self.end == count
+                if expand:
+                    self.end = destination
+                else:
+                    self.start = destination
+                    self.end = destination
+                return moved_all
+
+        class Doc:
+            pass
+
+        text = Text("0123456789abcdefghij")
+        doc = Doc()
+        doc.view_cursor = Range(text, 10)
+        settings = module.normalize_settings(
+            {"max_context_words": "0", "prefix_chars": "4", "suffix_chars": "5"}
+        )
+        original_view_cursor = module._view_cursor
+        module._view_cursor = lambda current_doc: current_doc.view_cursor
+        try:
+            _cursor, prefix, suffix = module._get_text_context(doc, settings)
+        finally:
+            module._view_cursor = original_view_cursor
+
+        self.assertEqual(prefix, "6789")
+        self.assertEqual(suffix, "abcde")
+        self.assertNotIn("abcdefghij", prefix)
+
+    def test_escape_regeneration_changes_direction_without_shrinking_target(self):
+        module = load_module()
+
+        class Range:
+            def __init__(self, value):
+                self.value = value
+
+            def getString(self):
+                return self.value
+
+            def setString(self, value):
+                self.value = value
+
+            def getStart(self):
+                return self
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "retry-document"
+
+        doc = Doc()
+        key = module._doc_key(doc)
+        original_move = module._move_view_cursor_to_range
+        original_restore = module._restore_insertion_properties
+        module._move_view_cursor_to_range = lambda *args: None
+        module._restore_insertion_properties = lambda *args: None
+        try:
+            first = module.GhostCompletion(
+                doc,
+                Range(" first rejected direction"),
+                " first rejected direction",
+                {},
+                request_prefix="Before cursor",
+                request_suffix="After cursor",
+                regeneration_attempt=0,
+            )
+            module._GHOSTS[key] = first
+            self.assertTrue(module._reject_ghost(doc))
+            regeneration = module._regeneration_for_context(key, "Before cursor", "After cursor")
+
+            second = module.GhostCompletion(
+                doc,
+                Range(" second rejected direction"),
+                " second rejected direction",
+                {},
+                request_prefix="Before cursor",
+                request_suffix="After cursor",
+                regeneration_attempt=regeneration["attempt"],
+            )
+            module._GHOSTS[key] = second
+            self.assertTrue(module._reject_ghost(doc))
+            regeneration = module._regeneration_for_context(key, "Before cursor", "After cursor")
+
+            settings = module.normalize_settings({"prediction_words": "40", "max_tokens": "96"})
+            prompt = module.build_messages(
+                "Before cursor", "After cursor", settings, regeneration=regeneration
+            )[1]["content"]
+        finally:
+            module._move_view_cursor_to_range = original_move
+            module._restore_insertion_properties = original_restore
+            module._GHOSTS.pop(key, None)
+            module._REGENERATION_STATES.pop(key, None)
+
+        self.assertEqual(regeneration["attempt"], 2)
+        self.assertEqual(
+            regeneration["rejected"],
+            [" first rejected direction", " second rejected direction"],
+        )
+        self.assertIn("Regeneration attempt 2", prompt)
+        self.assertIn("first rejected direction", prompt)
+        self.assertIn("second rejected direction", prompt)
+        self.assertIn("Keep the requested length near 40 words", prompt)
+        self.assertIn("Aim for 40 words", prompt)
+        self.assertEqual(module._completion_token_limit(settings), 80)
+
+    def test_regeneration_state_resets_when_cursor_context_changes(self):
+        module = load_module()
+        key = "retry-context-change"
+        module._REGENERATION_STATES[key] = {
+            "prefix": "original prefix",
+            "suffix": "original suffix",
+            "attempt": 2,
+            "rejected": ["one", "two"],
+        }
+        try:
+            self.assertIsNone(module._regeneration_for_context(key, "edited prefix", "original suffix"))
+            self.assertNotIn(key, module._REGENERATION_STATES)
+        finally:
+            module._REGENERATION_STATES.pop(key, None)
 
     def test_discard_ghost_restores_insertion_properties(self):
         module = load_module()
@@ -579,6 +766,7 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIs(calls[0][1]["think"], False)
         self.assertEqual(calls[0][1]["prompt"], "before")
         self.assertIn("Okay, let me", calls[0][1]["options"]["stop"])
+        self.assertNotIn("\n\n", calls[0][1]["options"]["stop"])
 
     def test_request_ollama_chat_adds_qwen_no_think_when_reasoning_is_disabled(self):
         module = load_module()
@@ -623,6 +811,38 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIs(calls[0][1]["think"], True)
         self.assertTrue(calls[0][0].endswith("/api/generate"))
         self.assertNotIn("Okay, let me", calls[0][1]["options"]["stop"])
+
+    def test_ollama_regeneration_varies_sampling_but_not_output_budget(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(payload)
+            return {"response": "a different continuation"}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_model": "qwen3",
+                    "temperature": "0.45",
+                    "prediction_words": "40",
+                    "max_tokens": "96",
+                }
+            )
+            module.request_completion(
+                "before",
+                "after",
+                settings,
+                regeneration={"attempt": 2, "rejected": ["old continuation"]},
+            )
+        finally:
+            module._post_json = original
+
+        self.assertAlmostEqual(calls[0]["options"]["temperature"], 0.61)
+        self.assertEqual(calls[0]["options"]["num_predict"], 80)
 
     def test_clean_completion_strips_labels_and_fences(self):
         module = load_module()
@@ -711,6 +931,21 @@ class WriterAutocompleteTests(unittest.TestCase):
 
         cursor = Cursor()
         self.assertTrue(module._go_left(cursor, 65001, True))
+        self.assertEqual(cursor.calls, [(32000, True), (32000, True), (1001, True)])
+
+    def test_go_right_chunks_long_distances(self):
+        module = load_module()
+
+        class Cursor:
+            def __init__(self):
+                self.calls = []
+
+            def goRight(self, count, expand):
+                self.calls.append((count, expand))
+                return True
+
+        cursor = Cursor()
+        self.assertTrue(module._go_right(cursor, 65001, True))
         self.assertEqual(cursor.calls, [(32000, True), (32000, True), (1001, True)])
 
 

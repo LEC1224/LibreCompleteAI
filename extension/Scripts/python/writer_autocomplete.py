@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import threading
@@ -85,6 +86,7 @@ _HANDLERS = {}
 _BUSY_DOCS = set()
 _GHOSTS = {}
 _CONTEXT_SUMMARIES = {}
+_REGENERATION_STATES = {}
 _LAST_AUTO_REQUEST = {}
 _LAST_AUTO_PREFIX = {}
 _CONTINUOUS_REQUESTS = {}
@@ -100,6 +102,7 @@ SUMMARY_REFRESH_WORDS = 120
 SUMMARY_RECENT_MIN_WORDS = 80
 SUMMARY_RECENT_RATIO = 0.5
 MAX_CONTEXT_CHAR_CAP = 80000
+MAX_REJECTED_COMPLETIONS = 3
 SETTINGS_FIELDS = (
     "provider",
     "openai_api_key",
@@ -116,6 +119,13 @@ SETTINGS_FIELDS = (
     "prefix_chars",
     "suffix_chars",
     "writing_guidance",
+)
+INTEGER_SETTINGS = (
+    "max_tokens",
+    "prediction_words",
+    "max_context_words",
+    "prefix_chars",
+    "suffix_chars",
 )
 BOOLEAN_SETTINGS = ("continuous_suggestions", "allow_reasoning")
 SLIDER_SETTINGS = {
@@ -160,6 +170,12 @@ def normalize_settings(settings):
     for key in SETTINGS_FIELDS:
         merged[key] = str(merged.get(key, DEFAULT_SETTINGS[key])).strip()
 
+    for key in INTEGER_SETTINGS:
+        merged[key] = str(_parse_integer(merged[key], DEFAULT_SETTINGS[key]))
+    merged["temperature"] = _format_number(
+        _parse_localized_number(merged["temperature"], DEFAULT_SETTINGS["temperature"])
+    )
+
     return merged
 
 
@@ -184,19 +200,44 @@ def save_settings(settings):
 
 
 def _int_setting(settings, key):
-    try:
-        value = int(str(settings.get(key, DEFAULT_SETTINGS[key])).strip())
-    except Exception:
-        value = int(DEFAULT_SETTINGS[key])
-    return max(0, value)
+    return _parse_integer(settings.get(key, DEFAULT_SETTINGS[key]), DEFAULT_SETTINGS[key])
 
 
 def _float_setting(settings, key):
-    try:
-        value = float(str(settings.get(key, DEFAULT_SETTINGS[key])).strip())
-    except Exception:
-        value = float(DEFAULT_SETTINGS[key])
+    value = _parse_localized_number(settings.get(key, DEFAULT_SETTINGS[key]), DEFAULT_SETTINGS[key])
     return max(0.0, min(2.0, value))
+
+
+def _parse_integer(value, default):
+    return max(0, int(_parse_localized_number(value, default)))
+
+
+def _parse_localized_number(value, default):
+    """Parse settings written using either decimal commas or decimal points."""
+    text = str(value).strip().replace("\u00a0", "").replace("\u202f", "").replace(" ", "")
+    if not text:
+        text = str(default)
+
+    if "," in text and "." in text:
+        decimal_separator = "," if text.rfind(",") > text.rfind(".") else "."
+        grouping_separator = "." if decimal_separator == "," else ","
+        text = text.replace(grouping_separator, "")
+        if decimal_separator == ",":
+            text = text.replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
+
+    try:
+        number = float(text)
+    except Exception:
+        number = float(str(default).replace(",", "."))
+    if not math.isfinite(number):
+        number = float(str(default).replace(",", "."))
+    return number
+
+
+def _format_number(value):
+    return format(value, ".15g")
 
 
 def _bool_setting(settings, key):
@@ -205,12 +246,17 @@ def _bool_setting(settings, key):
 
 
 def _prediction_words(settings):
-    return max(1, _int_setting(settings, "prediction_words"))
+    config = SLIDER_SETTINGS["prediction_words"]
+    return _clamp(_int_setting(settings, "prediction_words"), config["minimum"], config["maximum"])
 
 
 def _completion_token_limit(settings):
     token_cap = _int_setting(settings, "max_tokens")
-    return max(8, token_cap)
+    # A provider-side budget tied to the requested word count makes short
+    # predictions stop near their target. The explicit token cap remains the
+    # absolute ceiling for unusually token-dense text and reasoning models.
+    word_budget = int(math.ceil(_prediction_words(settings) * 2.0))
+    return max(8, min(max(8, token_cap), word_budget))
 
 
 def _summary_token_limit(settings):
@@ -218,15 +264,18 @@ def _summary_token_limit(settings):
     return max(96, min(512, max_context_words // 2))
 
 
-def build_messages(prefix, suffix, settings):
+def build_messages(prefix, suffix, settings, regeneration=None):
     max_words = _prediction_words(settings)
+    min_words = max(1, int(math.floor(max_words * 0.8)))
     guidance = settings.get("writing_guidance") or DEFAULT_SETTINGS["writing_guidance"]
     reasoning_instruction = _reasoning_instruction(settings)
+    regeneration_instruction = _regeneration_instruction(regeneration, max_words)
     user_prompt = (
         "Continue the document at <cursor>.\n\n"
         "Writing guidance:\n"
         f"{guidance}\n\n"
         f"{reasoning_instruction}\n\n"
+        f"{regeneration_instruction}"
         "Text before <cursor>:\n"
         "<before>\n"
         f"{prefix}\n"
@@ -235,12 +284,37 @@ def build_messages(prefix, suffix, settings):
         "<after>\n"
         f"{suffix}\n"
         "</after>\n\n"
-        f"Return only the text to insert at <cursor>. Start directly with document text. Use {max_words} words or fewer."
+        f"Return only the text to insert at <cursor>. Start directly with document text. "
+        f"Aim for {max_words} words; when the document can be continued naturally, use {min_words}-{max_words} words. "
+        f"Never exceed {max_words} words."
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+
+
+def _regeneration_instruction(regeneration, target_words):
+    if not regeneration or not regeneration.get("attempt"):
+        return ""
+
+    attempt = max(1, int(regeneration.get("attempt", 1)))
+    directions = (
+        "Take a different narrative or argumentative direction from the rejected attempt.",
+        "Try a fresh angle with a noticeably different sentence structure and emphasis.",
+        "Prefer a less obvious but still seamless next idea, image, detail, or action.",
+    )
+    instruction = directions[(attempt - 1) % len(directions)]
+    rejected = [str(item).strip() for item in regeneration.get("rejected", ()) if str(item).strip()]
+    rejected_block = ""
+    if rejected:
+        rejected_lines = "\n".join(f"- {item[:500]}" for item in rejected[-MAX_REJECTED_COMPLETIONS:])
+        rejected_block = f"\nDo not repeat these rejected suggestions:\n{rejected_lines}"
+    return (
+        f"Regeneration attempt {attempt}: {instruction} "
+        f"Keep the requested length near {target_words} words; do not shorten it merely because this is a retry."
+        f"{rejected_block}\n\n"
+    )
 
 
 def build_summary_messages(text, settings):
@@ -396,13 +470,19 @@ def _remove_prefix_echo(prefix, completion):
     return completion
 
 
-def request_completion(prefix, suffix, settings, cache_key=None):
+def request_completion(prefix, suffix, settings, cache_key=None, regeneration=None):
     settings = normalize_settings(settings)
     prefix = _compress_context_if_needed(prefix, settings, cache_key)
     if settings["provider"] == "ollama":
-        raw = _request_ollama_completion(prefix, suffix, settings, _completion_token_limit(settings))
+        raw = _request_ollama_completion(
+            prefix,
+            suffix,
+            settings,
+            _completion_token_limit(settings),
+            regeneration=regeneration,
+        )
     else:
-        messages = build_messages(prefix, suffix, settings)
+        messages = build_messages(prefix, suffix, settings, regeneration=regeneration)
         raw = _request_openai_messages(messages, settings, _completion_token_limit(settings))
     return clean_completion(raw, prefix, max_words=_prediction_words(settings))
 
@@ -449,12 +529,25 @@ def _request_ollama(prefix, suffix, settings):
     return _request_ollama_completion(prefix, suffix, settings, _completion_token_limit(settings))
 
 
-def _request_ollama_completion(prefix, suffix, settings, token_limit=None, temperature=None):
+def _request_ollama_completion(
+    prefix,
+    suffix,
+    settings,
+    token_limit=None,
+    temperature=None,
+    regeneration=None,
+):
     model = settings.get("ollama_model")
     if not model:
         raise RuntimeError("Ollama provider is selected, but no model label is configured.")
 
     host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
+    request_temperature = _float_setting(settings, "temperature") if temperature is None else temperature
+    if regeneration and regeneration.get("attempt"):
+        # Raw Ollama generation deliberately has no metaprompt because any
+        # instruction text can leak into the prose. Increase sampling diversity
+        # slightly on explicit retries while preserving the same output budget.
+        request_temperature = min(1.2, request_temperature + min(int(regeneration["attempt"]), 4) * 0.08)
     payload = {
         "model": model,
         "prompt": _ollama_completion_prompt(prefix, suffix, settings),
@@ -462,7 +555,7 @@ def _request_ollama_completion(prefix, suffix, settings, token_limit=None, tempe
         "raw": True,
         "think": _ollama_think_setting(settings),
         "options": {
-            "temperature": _float_setting(settings, "temperature") if temperature is None else temperature,
+            "temperature": request_temperature,
             "num_predict": token_limit or _completion_token_limit(settings),
             "stop": _ollama_completion_stop_sequences(settings),
         },
@@ -479,7 +572,10 @@ def _ollama_completion_prompt(prefix, suffix, settings):
 
 
 def _ollama_completion_stop_sequences(settings):
-    stop = ["\n\n"]
+    # Do not stop at the first paragraph boundary: that made larger prediction
+    # targets behave like the old ~24-word default. num_predict and the final
+    # word cap now provide the length boundaries.
+    stop = []
     if not _bool_setting(settings, "allow_reasoning"):
         stop.extend(
             [
@@ -757,12 +853,15 @@ def _get_text_context(doc, settings):
 
     text = view_cursor.getText()
 
+    # Anchor both ranges at the actual insertion point. In particular, never
+    # create the prefix from the document end: text after the cursor must not
+    # consume any of the before-cursor character budget.
     prefix_cursor = text.createTextCursorByRange(view_cursor.getStart())
-    prefix_cursor.goLeft(_prefix_char_budget(settings), True)
+    _go_left(prefix_cursor, _prefix_char_budget(settings), True)
     prefix = prefix_cursor.getString()
 
     suffix_cursor = text.createTextCursorByRange(view_cursor.getEnd())
-    suffix_cursor.goRight(_int_setting(settings, "suffix_chars"), True)
+    _go_right(suffix_cursor, _int_setting(settings, "suffix_chars"), True)
     suffix = suffix_cursor.getString()
 
     return view_cursor, prefix, suffix
@@ -806,11 +905,23 @@ def _cursor_is_collapsed(cursor):
 
 
 class GhostCompletion:
-    def __init__(self, doc, text_range, completion, original_properties):
+    def __init__(
+        self,
+        doc,
+        text_range,
+        completion,
+        original_properties,
+        request_prefix=None,
+        request_suffix=None,
+        regeneration_attempt=0,
+    ):
         self.doc = doc
         self.text_range = text_range
         self.completion = completion
         self.original_properties = original_properties
+        self.request_prefix = request_prefix
+        self.request_suffix = request_suffix
+        self.regeneration_attempt = regeneration_attempt
 
     def matches_document(self):
         try:
@@ -871,9 +982,11 @@ def _has_ghost(doc):
 
 
 def _accept_ghost(doc):
-    ghost = _GHOSTS.pop(_doc_key(doc), None)
+    key = _doc_key(doc)
+    ghost = _GHOSTS.pop(key, None)
     if ghost:
         ghost.accept()
+        _REGENERATION_STATES.pop(key, None)
         return True
     return False
 
@@ -883,6 +996,8 @@ def _accept_partial_ghost(doc, unit):
     ghost = _GHOSTS.get(key)
     if not ghost:
         return False
+
+    _REGENERATION_STATES.pop(key, None)
 
     if unit == "word":
         count = _next_ghost_word_count(ghost.completion)
@@ -933,7 +1048,48 @@ def _discard_ghost(doc):
     return False
 
 
-def _show_ghost_completion(doc, view_cursor, completion):
+def _reject_ghost(doc):
+    key = _doc_key(doc)
+    ghost = _GHOSTS.pop(key, None)
+    if not ghost:
+        return False
+
+    ghost.discard()
+    if ghost.request_prefix is None or ghost.request_suffix is None:
+        _REGENERATION_STATES.pop(key, None)
+        return True
+
+    previous = _REGENERATION_STATES.get(key, {})
+    rejected = list(previous.get("rejected", ()))
+    rejected.append(ghost.completion)
+    _REGENERATION_STATES[key] = {
+        "prefix": ghost.request_prefix,
+        "suffix": ghost.request_suffix,
+        "attempt": ghost.regeneration_attempt + 1,
+        "rejected": rejected[-MAX_REJECTED_COMPLETIONS:],
+    }
+    return True
+
+
+def _regeneration_for_context(key, prefix, suffix):
+    state = _REGENERATION_STATES.get(key)
+    if state and state.get("prefix") == prefix and state.get("suffix") == suffix:
+        return {
+            "attempt": state.get("attempt", 0),
+            "rejected": list(state.get("rejected", ())),
+        }
+    _REGENERATION_STATES.pop(key, None)
+    return None
+
+
+def _show_ghost_completion(
+    doc,
+    view_cursor,
+    completion,
+    request_prefix=None,
+    request_suffix=None,
+    regeneration_attempt=0,
+):
     _discard_ghost(doc)
 
     text = view_cursor.getText()
@@ -945,7 +1101,15 @@ def _show_ghost_completion(doc, view_cursor, completion):
     _apply_ghost_style(ghost_range)
     _move_view_cursor_to_range(doc, ghost_range.getStart())
 
-    _GHOSTS[_doc_key(doc)] = GhostCompletion(doc, ghost_range, completion, original_properties)
+    _GHOSTS[_doc_key(doc)] = GhostCompletion(
+        doc,
+        ghost_range,
+        completion,
+        original_properties,
+        request_prefix=request_prefix,
+        request_suffix=request_suffix,
+        regeneration_attempt=regeneration_attempt,
+    )
 
 
 def _capture_properties(text_range, names):
@@ -1007,6 +1171,17 @@ def _go_left(cursor, count, expand):
     return True
 
 
+def _go_right(cursor, count, expand):
+    remaining = max(0, int(count))
+    while remaining:
+        step = min(remaining, 32000)
+        if not cursor.goRight(step, expand):
+            return False
+        remaining -= step
+        expand = True
+    return True
+
+
 def complete_current_position(doc=None, preview=True, quiet=False):
     doc = doc or _current_document()
     if not _is_writer_document(doc):
@@ -1028,11 +1203,19 @@ def complete_current_position(doc=None, preview=True, quiet=False):
     try:
         status.start("Generating writing autocomplete...", 0)
         view_cursor, prefix, suffix = _get_text_context(doc, settings)
-        completion = request_completion(prefix, suffix, settings, key)
+        regeneration = _regeneration_for_context(key, prefix, suffix)
+        completion = request_completion(prefix, suffix, settings, key, regeneration=regeneration)
         completion = _completion_with_context_spacing(prefix, completion)
         if completion:
             if preview:
-                _show_ghost_completion(doc, view_cursor, completion)
+                _show_ghost_completion(
+                    doc,
+                    view_cursor,
+                    completion,
+                    request_prefix=prefix,
+                    request_suffix=suffix,
+                    regeneration_attempt=(regeneration or {}).get("attempt", 0),
+                )
             else:
                 _insert_completion(view_cursor, completion)
         else:
@@ -1285,7 +1468,7 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
                     _accept_ghost(self.doc)
                     return True
                 if key_code == ESCAPE and modifiers == 0:
-                    _discard_ghost(self.doc)
+                    _reject_ghost(self.doc)
                     return True
                 if key_code == RIGHT and modifiers == 0:
                     _accept_partial_ghost(self.doc, "char")
@@ -1294,6 +1477,7 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
                     _accept_partial_ghost(self.doc, "word")
                     return True
                 _discard_ghost(self.doc)
+                _REGENERATION_STATES.pop(_doc_key(self.doc), None)
                 return False
 
             if key_code == TAB and modifiers == 0:
@@ -1388,6 +1572,7 @@ def disable_autocomplete_for_doc(doc, notify=False):
     controller, handler = _HANDLERS.pop(key)
     try:
         _discard_ghost(doc)
+        _REGENERATION_STATES.pop(key, None)
         _clear_continuous_state(key)
         controller.removeKeyHandler(handler)
     finally:
