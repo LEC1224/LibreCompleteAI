@@ -4,7 +4,7 @@
   xmlns:d="http://openoffice.org/extensions/description/2006"
   xmlns:xlink="http://www.w3.org/1999/xlink">
   <identifier value="org.codex.librecompleteai"/>
-  <version value="0.2.0"/>
+  <version value="0.2.1"/>
   <display-name>
     <name lang="en">LibreCompleteAI</name>
   </display-name>
