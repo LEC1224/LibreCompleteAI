@@ -1334,6 +1334,342 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertTrue(module._go_right(cursor, 65001, True))
         self.assertEqual(cursor.calls, [(32000, True), (32000, True), (1001, True)])
 
+    def test_build_revision_messages_uses_selection_and_surrounding_context(self):
+        module = load_module()
+        settings = module.normalize_settings({})
+        messages = module.build_revision_messages(
+            "He walked into the forest unworried [Use a more fitting verb and adjective]",
+            "Rain stopped at dawn.",
+            "The birds had fallen silent.",
+            settings,
+        )
+        system, prompt = (message["content"] for message in messages)
+
+        self.assertIn("already correct, return it\nexactly unchanged", system)
+        self.assertIn("private editing guidance", system)
+        self.assertIn("Rain stopped at dawn.", prompt)
+        self.assertIn("Use a more fitting verb and adjective", prompt)
+        self.assertIn("The birds had fallen silent.", prompt)
+        self.assertIn("<selection>", prompt)
+
+    def test_revision_context_collects_at_most_ten_words_on_each_side(self):
+        module = load_module()
+
+        class Text:
+            def __init__(self, value):
+                self.value = value
+
+            def createTextCursorByRange(self, text_range):
+                return Range(self, text_range.start, text_range.end)
+
+        class Range:
+            def __init__(self, text, start, end=None):
+                self.text = text
+                self.start = start
+                self.end = start if end is None else end
+
+            def isCollapsed(self):
+                return self.start == self.end
+
+            def getText(self):
+                return self.text
+
+            def getStart(self):
+                return Range(self.text, self.start)
+
+            def getEnd(self):
+                return Range(self.text, self.end)
+
+            def getString(self):
+                return self.text.value[self.start : self.end]
+
+            def goLeft(self, count, expand):
+                destination = max(0, self.start - count)
+                if expand:
+                    self.start = destination
+                else:
+                    self.start = destination
+                    self.end = destination
+                return destination == self.start - count
+
+            def goRight(self, count, expand):
+                destination = min(len(self.text.value), self.end + count)
+                if expand:
+                    self.end = destination
+                else:
+                    self.start = destination
+                    self.end = destination
+                return destination == self.end + count
+
+        before_words = "one two three four five six seven eight nine ten eleven twelve"
+        selected = "teh selected phrase"
+        after_words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+        text = Text(f"{before_words} {selected} {after_words}")
+        start = text.value.index(selected)
+        doc = type("Doc", (), {"view_cursor": Range(text, start, start + len(selected))})()
+        original_view_cursor = module._view_cursor
+        module._view_cursor = lambda current_doc: current_doc.view_cursor
+        try:
+            _cursor, current, before, after = module._get_revision_context(doc)
+        finally:
+            module._view_cursor = original_view_cursor
+
+        self.assertEqual(current, selected)
+        self.assertEqual(before.split(), before_words.split()[-10:])
+        self.assertEqual(after.split(), after_words.split()[:10])
+
+    def test_request_revision_sends_after_selection_context_to_openai(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(payload)
+            return {"choices": [{"message": {"content": "He strolled into the forest confidently."}}]}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "openai_api_key": "sk-test",
+                    "max_tokens": "80",
+                    "prediction_words": "3",
+                }
+            )
+            revision = module.request_revision(
+                "He walked into the forest unworried [Improve the word choice]",
+                "The storm had finally passed.",
+                "He whistled as he went.",
+                settings,
+            )
+        finally:
+            module._post_json = original
+
+        self.assertEqual(revision, "He strolled into the forest confidently.")
+        self.assertEqual(calls[0]["max_completion_tokens"], 80)
+        prompt = "\n".join(message["content"] for message in calls[0]["messages"])
+        self.assertIn("The storm had finally passed.", prompt)
+        self.assertIn("He whistled as he went.", prompt)
+        self.assertIn("Improve the word choice", prompt)
+
+    def test_request_revision_uses_ollama_guided_schema(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append((url, payload))
+            return {"message": {"content": '{"completion":"A corrected phrase."}'}}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "ollama",
+                    "ollama_completion_mode": "guided",
+                    "max_tokens": "80",
+                }
+            )
+            revision = module.request_revision(
+                "A corected phrase.",
+                "The opening sentence.",
+                "The next sentence.",
+                settings,
+            )
+        finally:
+            module._post_json = original
+
+        self.assertEqual(revision, "A corrected phrase.")
+        self.assertTrue(calls[0][0].endswith("/api/chat"))
+        self.assertEqual(calls[0][1]["format"], module.OLLAMA_COMPLETION_SCHEMA)
+        prompt = "\n".join(message["content"] for message in calls[0][1]["messages"])
+        self.assertIn("The opening sentence.", prompt)
+        self.assertIn("The next sentence.", prompt)
+
+    def test_clean_revision_preserves_an_unchanged_selection_exactly(self):
+        module = load_module()
+        selected = "  This sentence is correct.  "
+        self.assertEqual(module._clean_revision("This sentence is correct.", selected), selected)
+
+    def test_clean_revision_removes_echoed_square_bracket_guidance(self):
+        module = load_module()
+        selected = "He walked [Use a more fitting verb]"
+        self.assertEqual(
+            module._clean_revision("He strolled [Use a more fitting verb]", selected),
+            "He strolled",
+        )
+
+    def test_rejected_revision_remembers_candidate_for_a_distinct_retry(self):
+        module = load_module()
+
+        class Range:
+            def __init__(self, value):
+                self.value = value
+
+            def getString(self):
+                return self.value
+
+            def setString(self, value):
+                self.value = value
+
+            def getStart(self):
+                return self
+
+            def getEnd(self):
+                return self
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "revision-retry-document"
+
+        doc = Doc()
+        key = module._doc_key(doc)
+        original_select = module._select_view_range
+        original_restore = module._restore_insertion_properties
+        module._select_view_range = lambda *args: None
+        module._restore_insertion_properties = lambda *args: None
+        try:
+            ghost = module.GhostRevision(
+                doc,
+                Range("He walked."),
+                "He walked.",
+                Range("He strolled."),
+                "He strolled.",
+                {},
+                "revision-context",
+            )
+            module._GHOSTS[key] = ghost
+            self.assertTrue(module._reject_ghost(doc))
+            regeneration = module._revision_regeneration_for_context(key, "revision-context")
+            prompt = module.build_revision_messages(
+                "He walked.", "Before", "After", module.normalize_settings({}), regeneration
+            )[1]["content"]
+        finally:
+            module._select_view_range = original_select
+            module._restore_insertion_properties = original_restore
+            module._GHOSTS.pop(key, None)
+            module._REVISION_REGENERATION_STATES.pop(key, None)
+
+        self.assertEqual(ghost.revision_range.getString(), "")
+        self.assertEqual(regeneration["attempt"], 1)
+        self.assertEqual(regeneration["rejected"], ["He strolled."])
+        self.assertIn("genuinely different revision", prompt)
+        self.assertIn("He strolled.", prompt)
+
+    def test_accepting_a_revision_replaces_the_selection_and_removes_preview(self):
+        module = load_module()
+
+        class Range:
+            def __init__(self, value):
+                self.value = value
+
+            def getString(self):
+                return self.value
+
+            def setString(self, value):
+                self.value = value
+
+            def getEnd(self):
+                return self
+
+        class Doc:
+            pass
+
+        doc = Doc()
+        source = Range("He walked.")
+        preview = Range("He strolled.")
+        original_move = module._move_view_cursor_to_range
+        original_restore = module._restore_insertion_properties
+        module._move_view_cursor_to_range = lambda *args: None
+        module._restore_insertion_properties = lambda *args: None
+        try:
+            ghost = module.GhostRevision(
+                doc,
+                source,
+                "He walked.",
+                preview,
+                "He strolled.",
+                {},
+                "revision-context",
+            )
+            ghost.accept()
+        finally:
+            module._move_view_cursor_to_range = original_move
+            module._restore_insertion_properties = original_restore
+
+        self.assertEqual(source.getString(), "He strolled.")
+        self.assertEqual(preview.getString(), "")
+
+    def test_discarding_a_revision_for_typing_keeps_original_text(self):
+        module = load_module()
+
+        class Range:
+            def __init__(self, value):
+                self.value = value
+
+            def getString(self):
+                return self.value
+
+            def setString(self, value):
+                self.value = value
+
+            def getEnd(self):
+                return self
+
+        doc = object()
+        source = Range("He walked.")
+        preview = Range("He strolled.")
+        moved_to = []
+        original_move = module._move_view_cursor_to_range
+        original_restore = module._restore_insertion_properties
+        module._move_view_cursor_to_range = lambda current_doc, text_range: moved_to.append(text_range)
+        module._restore_insertion_properties = lambda *args: None
+        try:
+            ghost = module.GhostRevision(
+                doc,
+                source,
+                "He walked.",
+                preview,
+                "He strolled.",
+                {},
+                "revision-context",
+            )
+            ghost.discard(preserve_selection=False)
+        finally:
+            module._move_view_cursor_to_range = original_move
+            module._restore_insertion_properties = original_restore
+
+        self.assertEqual(source.getString(), "He walked.")
+        self.assertEqual(preview.getString(), "")
+        self.assertEqual(moved_to, [source])
+
+    def test_tab_routes_selected_text_to_revision(self):
+        module = load_module()
+
+        class Event:
+            KeyCode = module.TAB
+            Modifiers = 0
+            KeyChar = ""
+
+        calls = []
+        originals = {
+            "_has_ghost": module._has_ghost,
+            "_has_selected_text": module._has_selected_text,
+            "revise_current_selection": module.revise_current_selection,
+            "complete_current_position": module.complete_current_position,
+        }
+        module._has_ghost = lambda doc: False
+        module._has_selected_text = lambda doc: True
+        module.revise_current_selection = lambda doc, preview=True: calls.append(("revision", preview))
+        module.complete_current_position = lambda doc, preview=True: calls.append(("completion", preview))
+        try:
+            self.assertTrue(module.LibreCompleteAIKeyHandler(object()).keyPressed(Event()))
+        finally:
+            for name, value in originals.items():
+                setattr(module, name, value)
+
+        self.assertEqual(calls, [("revision", True)])
+
 
 if __name__ == "__main__":
     unittest.main()

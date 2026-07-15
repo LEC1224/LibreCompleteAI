@@ -94,11 +94,21 @@ Preserve the facts, names, chronology, unresolved questions, tone, language, and
 Do not continue the story or document.
 Return only a compact summary of the provided earlier context."""
 
+REVISION_SYSTEM_PROMPT = """You revise a selected passage in LibreOffice Writer.
+Return only the replacement passage, with no explanation, label, quotation marks, or markdown.
+Correct grammar, spelling, punctuation, and agreement while preserving the author's language, tone,
+meaning, tense, person, and formatting conventions unless an instruction in square brackets asks for a change.
+Square-bracketed text inside the selection is private editing guidance, not document text: follow it, then omit it
+and its brackets from the replacement. Use the surrounding context only to understand the selected passage; do not
+rewrite that context. If the selected passage has no square-bracketed guidance and is already correct, return it
+exactly unchanged. Do not explain your choices or mention the task, selection, instruction, model, or context."""
+
 _HANDLERS = {}
 _BUSY_DOCS = set()
 _GHOSTS = {}
 _CONTEXT_SUMMARIES = {}
 _REGENERATION_STATES = {}
+_REVISION_REGENERATION_STATES = {}
 _OLLAMA_GUIDED_UNAVAILABLE = set()
 _OLLAMA_GUIDED_FAILURES = {}
 _OLLAMA_GUIDED_LOCK = threading.RLock()
@@ -118,6 +128,8 @@ SUMMARY_RECENT_MIN_WORDS = 80
 SUMMARY_RECENT_RATIO = 0.5
 MAX_CONTEXT_CHAR_CAP = 80000
 MAX_REJECTED_COMPLETIONS = 3
+REVISION_CONTEXT_WORDS = 10
+REVISION_CONTEXT_CHAR_FALLBACK = 2000
 OLLAMA_COMPLETION_MODES = ("auto", "guided", "raw")
 OLLAMA_KEEP_ALIVE = "30m"
 OLLAMA_STRUCTURED_TOKEN_OVERHEAD = 12
@@ -345,6 +357,39 @@ def build_messages(prefix, suffix, settings, regeneration=None, structured=False
     ]
 
 
+def build_revision_messages(selected, before, after, settings, regeneration=None, structured=False):
+    regeneration_instruction = _revision_regeneration_instruction(regeneration)
+    if structured:
+        response_instruction = (
+            'Respond with one JSON object matching the provided schema. Put only the replacement passage in the '
+            '"completion" string.'
+        )
+    else:
+        response_instruction = "Return only the replacement passage. Start directly with document text."
+
+    user_prompt = (
+        "Revise the selected passage below.\n\n"
+        "Text immediately before the selection (up to ten words):\n"
+        "<before>\n"
+        f"{before}\n"
+        "</before>\n\n"
+        "Selected passage to replace:\n"
+        "<selection>\n"
+        f"{selected}\n"
+        "</selection>\n\n"
+        "Text immediately after the selection (up to ten words):\n"
+        "<after>\n"
+        f"{after}\n"
+        "</after>\n\n"
+        f"{regeneration_instruction}"
+        f"{response_instruction}"
+    )
+    return [
+        {"role": "system", "content": REVISION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
 def _regeneration_instruction(regeneration, target_words):
     if not regeneration or not regeneration.get("attempt"):
         return ""
@@ -368,6 +413,21 @@ def _regeneration_instruction(regeneration, target_words):
     return (
         f"Regeneration attempt {attempt}: {instruction} {length_instruction}"
         f"{rejected_block}\n\n"
+    )
+
+
+def _revision_regeneration_instruction(regeneration):
+    if not regeneration or not regeneration.get("attempt"):
+        return ""
+
+    rejected = [str(item).strip() for item in regeneration.get("rejected", ()) if str(item).strip()]
+    if not rejected:
+        return ""
+    rejected_lines = "\n".join(f"- {item[:500]}" for item in rejected[-MAX_REJECTED_COMPLETIONS:])
+    return (
+        "The user rejected these earlier replacement suggestions. Return a genuinely different revision: do not "
+        "repeat them, paraphrase them closely, or retain their distinctive wording or sentence structure.\n"
+        f"{rejected_lines}\n\n"
     )
 
 
@@ -404,7 +464,16 @@ def clean_completion(text, prefix="", max_words=None):
     text = _extract_labeled_completion(text)
 
     stripped = text.strip()
-    for label in ("Completion:", "Suggestion:", "Insert:", "Continuation:", "Possible continuation:"):
+    for label in (
+        "Completion:",
+        "Suggestion:",
+        "Insert:",
+        "Continuation:",
+        "Possible continuation:",
+        "Replacement:",
+        "Revision:",
+        "Revised text:",
+    ):
         if stripped.lower().startswith(label.lower()):
             text = stripped[len(label) :].lstrip()
             stripped = text.strip()
@@ -548,6 +617,50 @@ def request_completion(prefix, suffix, settings, cache_key=None, regeneration=No
     return _generate_completion_once(prefix, "", settings, regeneration)
 
 
+def request_revision(selected, before, after, settings, regeneration=None):
+    settings = normalize_settings(settings)
+    token_limit = _revision_token_limit(settings)
+    if settings["provider"] == "ollama":
+        raw = _request_ollama_revision(
+            selected,
+            before,
+            after,
+            settings,
+            token_limit,
+            regeneration=regeneration,
+        )
+    else:
+        messages = build_revision_messages(selected, before, after, settings, regeneration=regeneration)
+        raw = _request_openai_messages(messages, settings, token_limit)
+    return _clean_revision(raw, selected)
+
+
+def _revision_token_limit(settings):
+    # Revision must be able to reproduce a selected phrase even when the
+    # autocomplete prediction slider is set to a shorter target.
+    return max(8, _int_setting(settings, "max_tokens"))
+
+
+def _clean_revision(text, selected):
+    revision = clean_completion(text, max_words=None).strip()
+    for instruction in _revision_instruction_blocks(selected):
+        revision = revision.replace(instruction, "")
+    revision = revision.strip()
+    if not _has_revision_instruction(selected) and revision == selected.strip():
+        # Preserve selected leading and trailing whitespace exactly when a
+        # model correctly returns the unchanged selection.
+        return selected
+    return revision
+
+
+def _has_revision_instruction(selected):
+    return bool(_revision_instruction_blocks(selected))
+
+
+def _revision_instruction_blocks(selected):
+    return re.findall(r"\[[^\]]+\]", selected or "")
+
+
 def _generate_completion_once(prefix, suffix, settings, regeneration=None):
     if settings["provider"] == "ollama":
         raw = _request_ollama_completion(
@@ -614,22 +727,28 @@ def _request_ollama_completion(
     temperature=None,
     regeneration=None,
 ):
+    return _request_ollama_with_guided_fallback(
+        settings,
+        lambda: _request_ollama_guided_completion(
+            prefix, suffix, settings, token_limit, temperature, regeneration
+        ),
+        lambda: _ollama_auto_raw_fallback(
+            prefix, suffix, settings, token_limit, temperature, regeneration
+        ),
+    )
+
+
+def _request_ollama_with_guided_fallback(settings, guided_request, raw_request):
     mode = settings.get("ollama_completion_mode", "auto")
     if mode == "raw":
-        return _request_ollama_raw_completion(
-            prefix, suffix, settings, token_limit, temperature, regeneration
-        )
+        return raw_request()
 
     cache_key = _ollama_guided_cache_key(settings)
     if mode == "auto" and _ollama_guided_is_unavailable(cache_key):
-        return _ollama_auto_raw_fallback(
-            prefix, suffix, settings, token_limit, temperature, regeneration
-        )
+        return raw_request()
 
     try:
-        completion = _request_ollama_guided_completion(
-            prefix, suffix, settings, token_limit, temperature, regeneration
-        )
+        completion = guided_request()
         _note_ollama_guided_success(cache_key)
         return completion
     except _GuidedCompletionError:
@@ -644,14 +763,87 @@ def _request_ollama_completion(
             permanent=_is_ollama_guided_unsupported(exc),
         )
 
-    return _ollama_auto_raw_fallback(
-        prefix, suffix, settings, token_limit, temperature, regeneration
-    )
+    return raw_request()
 
 
 def _request_ollama_guided_completion(
     prefix,
     suffix,
+    settings,
+    token_limit=None,
+    temperature=None,
+    regeneration=None,
+):
+    messages = build_messages(
+        prefix,
+        suffix,
+        settings,
+        regeneration=regeneration,
+        structured=True,
+    )
+    completion = _request_ollama_guided_messages(messages, settings, token_limit, temperature, regeneration)
+
+    if not completion.strip():
+        return ""
+    cleaned = clean_completion(completion, prefix, max_words=_prediction_words(settings))
+    if not cleaned.strip():
+        raise _GuidedCompletionError("Ollama guided mode did not return a useful continuation.")
+    return cleaned
+
+
+def _request_ollama_revision(
+    selected,
+    before,
+    after,
+    settings,
+    token_limit=None,
+    temperature=None,
+    regeneration=None,
+):
+    messages = build_revision_messages(
+        selected,
+        before,
+        after,
+        settings,
+        regeneration=regeneration,
+        structured=True,
+    )
+    raw_prompt = _revision_raw_prompt(selected, before, after, settings, regeneration)
+
+    def guided_request():
+        completion = _request_ollama_guided_messages(
+            messages,
+            settings,
+            token_limit,
+            temperature,
+            regeneration,
+        )
+        if not completion.strip():
+            return ""
+        if not _clean_revision(completion, selected):
+            raise _GuidedCompletionError("Ollama guided mode did not return a useful revision.")
+        return completion
+
+    return _request_ollama_with_guided_fallback(
+        settings,
+        guided_request,
+        lambda: _request_ollama_raw_prompt(
+            raw_prompt,
+            settings,
+            token_limit,
+            temperature,
+            regeneration,
+        ),
+    )
+
+
+def _revision_raw_prompt(selected, before, after, settings, regeneration=None):
+    messages = build_revision_messages(selected, before, after, settings, regeneration=regeneration)
+    return "\n\n".join(message["content"] for message in messages) + "\n\nReplacement:\n"
+
+
+def _request_ollama_guided_messages(
+    messages,
     settings,
     token_limit=None,
     temperature=None,
@@ -663,13 +855,6 @@ def _request_ollama_guided_completion(
 
     host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
     base_limit = token_limit or _completion_token_limit(settings)
-    messages = build_messages(
-        prefix,
-        suffix,
-        settings,
-        regeneration=regeneration,
-        structured=True,
-    )
     payload = {
         "model": model,
         "messages": _ollama_messages_for_request(messages, settings),
@@ -701,13 +886,7 @@ def _request_ollama_guided_completion(
             raise TypeError("completion is not text")
     except Exception:
         raise _GuidedCompletionError("Ollama guided mode returned invalid structured output.")
-
-    if not completion.strip():
-        return ""
-    cleaned = clean_completion(completion, prefix, max_words=_prediction_words(settings))
-    if not cleaned.strip():
-        raise _GuidedCompletionError("Ollama guided mode did not return a useful continuation.")
-    return cleaned
+    return completion
 
 
 def _ollama_auto_raw_fallback(
@@ -731,6 +910,22 @@ def _request_ollama_raw_completion(
     temperature=None,
     regeneration=None,
 ):
+    return _request_ollama_raw_prompt(
+        _ollama_completion_prompt(prefix, suffix, settings),
+        settings,
+        token_limit,
+        temperature,
+        regeneration,
+    )
+
+
+def _request_ollama_raw_prompt(
+    prompt,
+    settings,
+    token_limit=None,
+    temperature=None,
+    regeneration=None,
+):
     model = settings.get("ollama_model")
     if not model:
         raise RuntimeError("Ollama provider is selected, but no model label is configured.")
@@ -738,7 +933,7 @@ def _request_ollama_raw_completion(
     host = (settings.get("ollama_host") or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
     payload = {
         "model": model,
-        "prompt": _ollama_completion_prompt(prefix, suffix, settings),
+        "prompt": prompt,
         "stream": False,
         "raw": True,
         "think": _ollama_think_setting(settings),
@@ -747,7 +942,7 @@ def _request_ollama_raw_completion(
             "temperature": _ollama_request_temperature(settings, temperature, regeneration),
             "num_predict": token_limit or _completion_token_limit(settings),
             "num_ctx": _ollama_context_window(
-                _ollama_completion_prompt(prefix, suffix, settings),
+                prompt,
                 token_limit or _completion_token_limit(settings),
             ),
             "stop": _ollama_completion_stop_sequences(settings),
@@ -1013,6 +1208,13 @@ def _last_words(text, count):
     return text[matches[-count].start() :].lstrip()
 
 
+def _first_words(text, count):
+    matches = list(re.finditer(r"\S+", text or ""))
+    if len(matches) <= count:
+        return text
+    return text[: matches[count - 1].end()].rstrip()
+
+
 class _GuidedCompletionError(RuntimeError):
     pass
 
@@ -1129,6 +1331,33 @@ def _get_text_context(doc, settings):
     return view_cursor, prefix, ""
 
 
+def _get_revision_context(doc):
+    view_cursor = _view_cursor(doc)
+    if _cursor_is_collapsed(view_cursor):
+        raise RuntimeError("Select a word or phrase to revise.")
+
+    selected = view_cursor.getString()
+    if not selected:
+        raise RuntimeError("Select a word or phrase to revise.")
+
+    text = view_cursor.getText()
+    before = _context_before_range(text, view_cursor.getStart(), REVISION_CONTEXT_WORDS)
+    after = _context_after_range(text, view_cursor.getEnd(), REVISION_CONTEXT_WORDS)
+    return view_cursor, selected, before, after
+
+
+def _context_before_range(text, text_range, word_count):
+    cursor = text.createTextCursorByRange(text_range)
+    _go_left(cursor, REVISION_CONTEXT_CHAR_FALLBACK, True)
+    return _last_words(cursor.getString(), word_count)
+
+
+def _context_after_range(text, text_range, word_count):
+    cursor = text.createTextCursorByRange(text_range)
+    _go_right(cursor, REVISION_CONTEXT_CHAR_FALLBACK, True)
+    return _first_words(cursor.getString(), word_count)
+
+
 def _prefix_char_budget(settings):
     legacy_chars = _int_setting(settings, "prefix_chars")
     context_words = _int_setting(settings, "max_context_words")
@@ -1164,6 +1393,13 @@ def _cursor_is_collapsed(cursor):
             return cursor.getString() == ""
         except Exception:
             return True
+
+
+def _has_selected_text(doc):
+    try:
+        return not _cursor_is_collapsed(_view_cursor(doc))
+    except Exception:
+        return False
 
 
 class GhostCompletion:
@@ -1237,6 +1473,61 @@ class GhostCompletion:
         _restore_insertion_properties(self.doc, start, self.original_properties)
 
 
+class GhostRevision:
+    def __init__(
+        self,
+        doc,
+        selected_range,
+        selected_text,
+        revision_range,
+        revision,
+        original_properties,
+        request_context,
+        regeneration_attempt=0,
+    ):
+        self.doc = doc
+        self.selected_range = selected_range
+        self.selected_text = selected_text
+        self.revision_range = revision_range
+        self.completion = revision
+        self.original_properties = original_properties
+        self.request_context = request_context
+        self.regeneration_attempt = regeneration_attempt
+
+    def matches_document(self):
+        try:
+            return (
+                self.selected_range.getString() == self.selected_text
+                and self.revision_range.getString() == self.completion
+            )
+        except Exception:
+            return False
+
+    def accept(self):
+        if not self.matches_document():
+            return
+
+        # The preview follows the selected passage. Remove it before replacing
+        # the source so the candidate never becomes part of the final text.
+        self.revision_range.setString("")
+        self.selected_range.setString(self.completion)
+        _apply_properties(self.selected_range, self.original_properties)
+        end = self.selected_range.getEnd()
+        _move_view_cursor_to_range(self.doc, end)
+        _restore_insertion_properties(self.doc, end, self.original_properties)
+
+    def discard(self, preserve_selection=True):
+        if self.revision_range.getString() == self.completion:
+            self.revision_range.setString("")
+        if preserve_selection:
+            _select_view_range(self.doc, self.selected_range)
+            _restore_insertion_properties(self.doc, self.selected_range, self.original_properties)
+            return
+        end = self.selected_range.getEnd()
+        _move_view_cursor_to_range(self.doc, end)
+        _restore_insertion_properties(self.doc, end, self.original_properties)
+
+
 def _has_ghost(doc):
     return _doc_key(doc) in _GHOSTS
 
@@ -1246,7 +1537,7 @@ def _accept_ghost(doc):
     ghost = _GHOSTS.pop(key, None)
     if ghost:
         ghost.accept()
-        _REGENERATION_STATES.pop(key, None)
+        _clear_regeneration_states(key)
         return True
     return False
 
@@ -1254,7 +1545,7 @@ def _accept_ghost(doc):
 def _accept_partial_ghost(doc, unit):
     key = _doc_key(doc)
     ghost = _GHOSTS.get(key)
-    if not ghost:
+    if not ghost or isinstance(ghost, GhostRevision):
         return False
 
     _REGENERATION_STATES.pop(key, None)
@@ -1300,10 +1591,13 @@ def _is_word_body_char(char):
     return char.isalnum() or char in "_'’-"
 
 
-def _discard_ghost(doc):
+def _discard_ghost(doc, preserve_selection=True):
     ghost = _GHOSTS.pop(_doc_key(doc), None)
     if ghost:
-        ghost.discard()
+        if isinstance(ghost, GhostRevision):
+            ghost.discard(preserve_selection=preserve_selection)
+        else:
+            ghost.discard()
         return True
     return False
 
@@ -1315,6 +1609,17 @@ def _reject_ghost(doc):
         return False
 
     ghost.discard()
+    if isinstance(ghost, GhostRevision):
+        previous = _REVISION_REGENERATION_STATES.get(key, {})
+        rejected = list(previous.get("rejected", ()))
+        rejected.append(ghost.completion)
+        _REVISION_REGENERATION_STATES[key] = {
+            "context": ghost.request_context,
+            "attempt": ghost.regeneration_attempt + 1,
+            "rejected": rejected[-MAX_REJECTED_COMPLETIONS:],
+        }
+        return True
+
     if ghost.request_prefix is None:
         _REGENERATION_STATES.pop(key, None)
         return True
@@ -1341,6 +1646,26 @@ def _regeneration_for_context(key, prefix, suffix):
     return None
 
 
+def _revision_regeneration_for_context(key, request_context):
+    state = _REVISION_REGENERATION_STATES.get(key)
+    if state and state.get("context") == request_context:
+        return {
+            "attempt": state.get("attempt", 0),
+            "rejected": list(state.get("rejected", ())),
+        }
+    _REVISION_REGENERATION_STATES.pop(key, None)
+    return None
+
+
+def _revision_request_context(selected, before, after):
+    return "\x1f".join((selected, before, after))
+
+
+def _clear_regeneration_states(key):
+    _REGENERATION_STATES.pop(key, None)
+    _REVISION_REGENERATION_STATES.pop(key, None)
+
+
 def _show_ghost_completion(
     doc,
     view_cursor,
@@ -1365,6 +1690,51 @@ def _show_ghost_completion(
         completion,
         original_properties,
         request_prefix=request_prefix,
+        regeneration_attempt=regeneration_attempt,
+    )
+
+
+def _show_ghost_revision(
+    doc,
+    view_cursor,
+    selected,
+    revision,
+    request_context,
+    regeneration_attempt=0,
+):
+    _discard_ghost(doc)
+
+    text = view_cursor.getText()
+    selected_start = view_cursor.getStart()
+    selected_range = text.createTextCursorByRange(selected_start)
+    if not _go_right(selected_range, len(selected), True):
+        raise RuntimeError("The selected text changed before its revision preview could be shown.")
+
+    original_properties = _capture_properties(selected_range, GHOST_PROPERTIES)
+    insertion_cursor = text.createTextCursorByRange(selected_range.getEnd())
+    # The insertion cursor is collapsed at the selected passage's end, so
+    # absorbing it adds the preview after the selection without replacing it.
+    text.insertString(insertion_cursor, revision, True)
+
+    # Recreate the source range from its fixed start after insertion. Writer
+    # cursors can otherwise include newly inserted boundary text.
+    selected_range = text.createTextCursorByRange(selected_start)
+    if not _go_right(selected_range, len(selected), True):
+        raise RuntimeError("The selected text changed while its revision preview was being shown.")
+    revision_range = text.createTextCursorByRange(insertion_cursor.getEnd())
+    if not _go_left(revision_range, len(revision), True):
+        raise RuntimeError("The revision preview could not be placed in the document.")
+    _apply_ghost_style(revision_range)
+    _select_view_range(doc, selected_range)
+
+    _GHOSTS[_doc_key(doc)] = GhostRevision(
+        doc,
+        selected_range,
+        selected,
+        revision_range,
+        revision,
+        original_properties,
+        request_context,
         regeneration_attempt=regeneration_attempt,
     )
 
@@ -1417,6 +1787,15 @@ def _move_view_cursor_to_range(doc, text_range):
         pass
 
 
+def _select_view_range(doc, text_range):
+    try:
+        view_cursor = _view_cursor(doc)
+        view_cursor.gotoRange(text_range.getStart(), False)
+        view_cursor.gotoRange(text_range.getEnd(), True)
+    except Exception:
+        pass
+
+
 def _go_left(cursor, count, expand):
     remaining = max(0, int(count))
     while remaining:
@@ -1439,6 +1818,55 @@ def _go_right(cursor, count, expand):
     return True
 
 
+def revise_current_selection(doc=None, preview=True, quiet=False):
+    doc = doc or _current_document()
+    if not _is_writer_document(doc):
+        if not quiet:
+            _message_box(doc, EXTENSION_NAME, "Open a Writer document before revising text.")
+        return
+
+    if _has_ghost(doc):
+        _accept_ghost(doc)
+        return
+
+    key = _doc_key(doc)
+    if key in _BUSY_DOCS:
+        return
+
+    settings = load_settings()
+    _BUSY_DOCS.add(key)
+    status = _status_indicator(doc)
+    try:
+        status.start("Revising selected text...", 0)
+        view_cursor, selected, before, after = _get_revision_context(doc)
+        request_context = _revision_request_context(selected, before, after)
+        regeneration = _revision_regeneration_for_context(key, request_context)
+        revision = request_revision(selected, before, after, settings, regeneration=regeneration)
+        if revision:
+            if preview:
+                _show_ghost_revision(
+                    doc,
+                    view_cursor,
+                    selected,
+                    revision,
+                    request_context,
+                    regeneration_attempt=(regeneration or {}).get("attempt", 0),
+                )
+            else:
+                view_cursor.setString(revision)
+        elif not quiet:
+            _message_box(doc, EXTENSION_NAME, "The model did not return a useful revision.")
+    except Exception as exc:
+        if not quiet:
+            _message_box(doc, EXTENSION_NAME, str(exc))
+    finally:
+        try:
+            status.end()
+        except Exception:
+            pass
+        _BUSY_DOCS.discard(key)
+
+
 def complete_current_position(doc=None, preview=True, quiet=False):
     doc = doc or _current_document()
     if not _is_writer_document(doc):
@@ -1448,6 +1876,10 @@ def complete_current_position(doc=None, preview=True, quiet=False):
 
     if _has_ghost(doc):
         _accept_ghost(doc)
+        return
+
+    if _has_selected_text(doc):
+        revise_current_selection(doc, preview=preview, quiet=quiet)
         return
 
     key = _doc_key(doc)
@@ -1727,17 +2159,20 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
                     _reject_ghost(self.doc)
                     return True
                 if key_code == RIGHT and modifiers == 0:
-                    _accept_partial_ghost(self.doc, "char")
-                    return True
+                    if _accept_partial_ghost(self.doc, "char"):
+                        return True
                 if key_code == RIGHT and _is_ctrl_only_modifier(modifiers):
-                    _accept_partial_ghost(self.doc, "word")
-                    return True
-                _discard_ghost(self.doc)
-                _REGENERATION_STATES.pop(_doc_key(self.doc), None)
+                    if _accept_partial_ghost(self.doc, "word"):
+                        return True
+                _discard_ghost(self.doc, preserve_selection=False)
+                _clear_regeneration_states(_doc_key(self.doc))
                 return False
 
             if key_code == TAB and modifiers == 0:
-                complete_current_position(self.doc, preview=True)
+                if _has_selected_text(self.doc):
+                    revise_current_selection(self.doc, preview=True)
+                else:
+                    complete_current_position(self.doc, preview=True)
                 return True
 
             _schedule_continuous_request_after_idle(self.doc, event)
@@ -1828,7 +2263,7 @@ def disable_autocomplete_for_doc(doc, notify=False):
     controller, handler = _HANDLERS.pop(key)
     try:
         _discard_ghost(doc)
-        _REGENERATION_STATES.pop(key, None)
+        _clear_regeneration_states(key)
         _clear_continuous_state(key)
         controller.removeKeyHandler(handler)
     finally:

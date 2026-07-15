@@ -18,6 +18,7 @@ It is intended for LibreOffice 7.0 or newer.
 - A compact `LC-AI` Writer toolbar with short text buttons for toggling LC-AI, continuous suggestions, completion, and settings.
 - A fallback "Complete Now" command if you want to test completion without enabling the Tab hook.
 - A ghost-text style preview: press Tab once to preview, press Tab again to accept.
+- Selected-text grammar, spelling, and wording revisions with optional square-bracketed editing guidance.
 - Optional continuous suggestions after natural writing pauses.
 - Context compression for long documents, using the same selected LLM.
 - Tunable context length and prediction length controls.
@@ -113,7 +114,9 @@ In Writer, use the `LC-AI` button on the LibreCompleteAI toolbar, or choose:
 Tools > Add-ons > Toggle LibreCompleteAI
 ```
 
-The `LC-AI` button stays pressed while LibreCompleteAI is enabled for the current Writer window. The secondary toolbar buttons are available only while LC-AI is enabled. Then press Tab while the cursor is in document text. The extension sends a small amount of text before the cursor to the selected model, asks for a natural continuation, and shows the result as pale temporary text at the cursor.
+The `LC-AI` button stays pressed while LibreCompleteAI is enabled for the current Writer window. The secondary toolbar buttons are available only while LC-AI is enabled. Press Tab while the cursor is in document text to send text before the cursor to the selected model, ask for a natural continuation, and show the result as pale temporary text at the cursor.
+
+To revise a word or phrase, select it and press Tab. LC-AI sends the selection and up to ten surrounding words on each side to the selected model, then previews a replacement in pale text directly after the selection. It corrects grammar and spelling while preserving the wording when it is already correct. Add square-bracketed guidance inside the selection when you want a substantive change, for example `He walked into the forest unworried [Use a more fitting verb and adjective]`. The bracketed guidance is sent to the model but is removed from the accepted replacement.
 
 For automatic background suggestions, use the `Continuous` toolbar button, or choose:
 
@@ -131,6 +134,8 @@ When a preview is visible:
 - Press Esc to dismiss it.
 - After dismissing with Esc, press Tab again for a fresh alternative. LC-AI varies the retry direction, remembers a short bounded history of rejected suggestions, and keeps the configured prediction-length target unchanged.
 - Keep typing to dismiss it and continue with your own text.
+
+For selected-text revision previews, Tab replaces the original selection (including any square-bracketed guidance) with the preview. Esc restores the original selection so Tab can request a fresh alternative; retries tell the model not to reuse rejected wording or a close paraphrase. Continuing to type removes the preview and leaves the original text in place.
 
 While enabled, plain Tab is consumed by the extension. Toggle LibreCompleteAI off to restore Writer's normal Tab behavior.
 

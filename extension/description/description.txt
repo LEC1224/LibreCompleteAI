@@ -1,1 +1,1 @@
-Adds Tab-triggered LLM autocomplete with ghost-text previews for LibreOffice Writer, with OpenAI-compatible and Ollama providers.
+Adds Tab-triggered LLM autocomplete and selected-text grammar, spelling, and instruction-guided revision with ghost-text previews for LibreOffice Writer, with OpenAI-compatible and Ollama providers.
