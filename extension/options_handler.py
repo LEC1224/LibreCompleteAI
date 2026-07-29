@@ -73,6 +73,7 @@ DEFAULT_SETTINGS = {
     "max_context_words": "600",
     "prefix_chars": "2400",
     "writing_guidance": "Match the author's language, tone, point of view, and pacing.",
+    "reference_files": "",
 }
 SETTINGS_FIELDS = (
     "provider",
@@ -92,6 +93,7 @@ SETTINGS_FIELDS = (
     "max_context_words",
     "prefix_chars",
     "writing_guidance",
+    "reference_files",
 )
 INTEGER_SETTINGS = (
     "max_tokens",
@@ -106,6 +108,8 @@ SLIDER_SETTINGS = {
 }
 OLLAMA_COMPLETION_MODES = ("auto", "guided", "raw")
 SUPPORTED_PROVIDERS = ("openai", "ollama", "codex")
+MAX_REFERENCE_FILES = 20
+REFERENCE_FILE_EXTENSIONS = (".md", ".txt")
 
 
 def _config_dir():
@@ -138,8 +142,12 @@ def normalize_settings(settings):
         ollama_mode = "auto"
     merged["ollama_completion_mode"] = ollama_mode
 
+    reference_files = merged.get("reference_files", "")
     for key in SETTINGS_FIELDS:
+        if key == "reference_files":
+            continue
         merged[key] = str(merged.get(key, DEFAULT_SETTINGS[key])).strip()
+    merged["reference_files"] = _reference_files_setting_value(reference_files)
 
     for key in INTEGER_SETTINGS:
         merged[key] = str(_parse_integer(merged[key], DEFAULT_SETTINGS[key]))
@@ -148,6 +156,35 @@ def normalize_settings(settings):
     )
 
     return merged
+
+
+def _reference_file_paths(value):
+    if isinstance(value, (list, tuple)):
+        candidates = value
+    else:
+        candidates = str(value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    paths = []
+    seen = set()
+    for candidate in candidates:
+        path = str(candidate or "").strip()
+        if len(path) >= 2 and path[0] == path[-1] and path[0] in ("'", '"'):
+            path = path[1:-1].strip()
+        if not path or os.path.splitext(path)[1].lower() not in REFERENCE_FILE_EXTENSIONS:
+            continue
+        path = os.path.abspath(os.path.expanduser(path))
+        dedupe_key = os.path.normcase(os.path.normpath(path))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        paths.append(path)
+        if len(paths) >= MAX_REFERENCE_FILES:
+            break
+    return tuple(paths)
+
+
+def _reference_files_setting_value(value):
+    return "\n".join(_reference_file_paths(value))
 
 
 def _parse_integer(value, default):
@@ -208,10 +245,15 @@ class LibreCompleteAIOptionsEventHandler(unohelper.Base, XServiceInfo, XContaine
     def callHandlerMethod(self, window, event_object, method):
         if method == "external_event":
             return self.handleExternalEvent(window, event_object)
+        if method == "add_reference_files":
+            return self.addReferenceFiles(window)
+        if method == "clear_reference_files":
+            _set_control_text(window, "reference_files", "")
+            return True
         return False
 
     def getSupportedMethodNames(self):
-        return ("external_event",)
+        return ("external_event", "add_reference_files", "clear_reference_files")
 
     def handleExternalEvent(self, window, event_object):
         if event_object in ("initialize", "back"):
@@ -240,6 +282,18 @@ class LibreCompleteAIOptionsEventHandler(unohelper.Base, XServiceInfo, XContaine
             else:
                 settings[name] = _get_control_text(window, name, settings.get(name, ""))
         save_settings(settings)
+
+    def addReferenceFiles(self, window):
+        runtime = _load_writer_runtime()
+        current = _reference_file_paths(_get_control_text(window, "reference_files", ""))
+        selected = runtime._pick_reference_files(self.ctx, current)
+        if selected:
+            _set_control_text(
+                window,
+                "reference_files",
+                _reference_files_setting_value(current + tuple(selected)),
+            )
+        return True
 
     def _connect_slider_listeners(self, window):
         if self.listeners:

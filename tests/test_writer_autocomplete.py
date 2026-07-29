@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -37,6 +38,30 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(settings["codex_model"], "")
         self.assertEqual(settings["max_context_words"], "600")
         self.assertEqual(settings["prediction_words"], "24")
+        self.assertEqual(settings["reference_files"], "")
+
+    def test_normalize_settings_keeps_unique_markdown_and_text_reference_files(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canon = root / "canon.md"
+            characters = root / "characters.TXT"
+            ignored = root / "notes.pdf"
+            settings = module.normalize_settings(
+                {
+                    "reference_files": [
+                        str(canon),
+                        str(characters),
+                        str(canon),
+                        str(ignored),
+                    ]
+                }
+            )
+
+        self.assertEqual(
+            settings["reference_files"].splitlines(),
+            [str(canon.resolve()), str(characters.resolve())],
+        )
 
     def test_normalize_settings_accepts_codex_provider(self):
         module = load_module()
@@ -116,6 +141,57 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIn("use 80-100 words", joined)
         self.assertNotIn("Elian's heart hammered as the dragon landed.", joined)
         self.assertNotIn("<after>", joined)
+
+    def test_build_messages_includes_reference_file_contents(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canon = root / "canon.md"
+            characters = root / "characters.txt"
+            canon.write_text("The northern moon is called Ilyra.", encoding="utf-8")
+            characters.write_text("Mara never removes her silver gloves.", encoding="utf-8")
+            settings = module.normalize_settings(
+                {"reference_files": [str(canon), str(characters)]}
+            )
+            messages = module.build_messages("Mara looked up.", "", settings)
+
+        joined = "\n".join(message["content"] for message in messages)
+        self.assertIn("Reference material:", joined)
+        self.assertIn("Reference file: canon.md", joined)
+        self.assertIn("The northern moon is called Ilyra.", joined)
+        self.assertIn("Reference file: characters.txt", joined)
+        self.assertIn("Mara never removes her silver gloves.", joined)
+        self.assertNotIn(str(root), joined)
+
+    def test_reference_context_skips_missing_and_unsupported_files(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing.md"
+            unsupported = root / "notes.pdf"
+            unsupported.write_text("Do not include this.", encoding="utf-8")
+            settings = dict(module.DEFAULT_SETTINGS)
+            settings["reference_files"] = "\n".join((str(missing), str(unsupported)))
+            block = module._reference_context_block(settings)
+
+        self.assertEqual(block, "")
+
+    def test_ollama_raw_prompt_includes_reference_context_when_configured(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            reference = Path(directory) / "world.md"
+            reference.write_text("Magic always has a visible cost.", encoding="utf-8")
+            settings = module.normalize_settings(
+                {
+                    "writing_guidance": "Use close third person.",
+                    "reference_files": str(reference),
+                }
+            )
+            prompt = module._ollama_completion_prompt("Mara raised her hand.", "", settings)
+
+        self.assertIn("Use close third person.", prompt)
+        self.assertIn("Magic always has a visible cost.", prompt)
+        self.assertTrue(prompt.endswith("Mara raised her hand."))
 
     def test_completion_token_limit_tracks_prediction_words_below_hard_cap(self):
         module = load_module()

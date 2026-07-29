@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -49,6 +50,34 @@ class OptionsHandlerTests(unittest.TestCase):
         self.assertEqual(settings["ollama_model"], "qwen3.5:4b")
         self.assertEqual(settings["ollama_completion_mode"], "auto")
         self.assertEqual(settings["max_context_words"], "600")
+        self.assertEqual(settings["reference_files"], "")
+
+    def test_normalize_settings_keeps_only_unique_text_reference_files(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canon = root / "canon.md"
+            characters = root / "characters.txt"
+            settings = module.normalize_settings(
+                {
+                    "reference_files": "\n".join(
+                        (str(canon), str(characters), str(canon), str(root / "image.png"))
+                    )
+                }
+            )
+
+        self.assertEqual(
+            settings["reference_files"].splitlines(),
+            [str(canon.resolve()), str(characters.resolve())],
+        )
+
+    def test_options_handler_supports_reference_file_buttons(self):
+        module = load_module()
+        handler = module.LibreCompleteAIOptionsEventHandler(ctx=None)
+        self.assertEqual(
+            handler.getSupportedMethodNames(),
+            ("external_event", "add_reference_files", "clear_reference_files"),
+        )
 
     def test_normalize_settings_validates_ollama_completion_mode(self):
         module = load_module()

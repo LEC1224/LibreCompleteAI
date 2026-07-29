@@ -16,6 +16,7 @@ It is intended for LibreOffice 7.0 or newer.
 - Ollama at a local or remote host, using any model you have downloaded.
 - Codex CLI access that reuses an existing Codex/ChatGPT login instead of storing an API key in the extension.
 - A LibreOffice settings dialog for provider and generation options.
+- One or more Markdown or plain-text reference files for canon, character notes, and world-building context.
 - A compact `LC-AI` Writer toolbar with short text buttons for toggling LC-AI, continuous suggestions, completion, and settings.
 - A fallback "Complete Now" command if you want to test completion without enabling the Tab hook.
 - A ghost-text style preview: press Tab once to preview, press Tab again to accept.
@@ -102,6 +103,13 @@ Generation controls:
 - `Prediction words`: the target suggestion length and hard maximum, wherever the cursor is in the document.
 - `Token cap`: the semantic output budget. Guided Ollama requests add a small internal allowance for their JSON envelope; extracted document text is still capped at the configured prediction-word count.
 
+Reference files:
+
+- Use `Add files...` to select one or several `.md` or `.txt` files. Add more files in another pass when they live in different folders.
+- The toolbar settings dialog lists the selected files and can remove individual entries. The normal LibreOffice Options page also accepts one path per line and provides `Add...` and `Clear` buttons.
+- LibreCompleteAI reads the files again for every suggestion, so saved changes to canon, character sheets, or world-building notes are used without reopening the settings dialog.
+- Up to 20 files are retained. Their combined prompt content is capped at 48,000 characters and shared across the available files; oversized files are marked as truncated in the model context. Missing, unreadable, empty, and unsupported files are skipped without blocking autocomplete.
+
 Ollama completion modes:
 
 - `auto`: sends an OpenAI-like guided chat request with before-cursor context, writing guidance, retry directions, disabled thinking, and a JSON schema containing only the completion. The extracted text still passes through the meta-response, prefix-echo, and length filters. If a model rejects structured output or returns invalid/meta text, LC-AI retries through raw continuation. After two guided failures from the same host/model, raw mode is cached for later requests during that LibreOffice session.
@@ -112,7 +120,7 @@ Ollama models are kept loaded for 30 minutes after a request to avoid repeated c
 
 Autocomplete always treats the cursor as the temporary end of the document. Already-written text after the cursor is neither extracted nor sent to the model, so a mid-document request behaves like an end-of-document continuation. The writer can decide how and whether to connect the generated passage to the later text.
 
-API keys are stored locally in plain text in the user's configuration directory.
+API keys and reference-file paths are stored locally in plain text in the user's configuration directory. Reference-file contents are sent to the selected model provider as part of each autocomplete request; with Ollama they stay on the configured Ollama host.
 
 If the API key field is left empty, LibreCompleteAI can still use an `OPENAI_API_KEY` environment variable at completion time. Environment keys are not displayed or saved by the settings UI.
 

@@ -7,7 +7,7 @@
   dlg:left="80"
   dlg:top="60"
   dlg:width="270"
-  dlg:height="334"
+  dlg:height="400"
   dlg:closeable="true"
   dlg:moveable="true"
   dlg:withtitlebar="false">
@@ -56,5 +56,14 @@
 
     <dlg:text dlg:id="writing_guidance_label" dlg:tab-index="34" dlg:left="6" dlg:top="288" dlg:width="74" dlg:height="8" dlg:value="Guidance"/>
     <dlg:textfield dlg:id="writing_guidance" dlg:tab-index="35" dlg:left="84" dlg:top="286" dlg:width="176" dlg:height="40" dlg:multiline="true" dlg:vscroll="true"/>
+
+    <dlg:text dlg:id="reference_files_label" dlg:tab-index="36" dlg:left="6" dlg:top="334" dlg:width="74" dlg:height="8" dlg:value="Reference files"/>
+    <dlg:textfield dlg:id="reference_files" dlg:tab-index="37" dlg:left="84" dlg:top="332" dlg:width="130" dlg:height="54" dlg:multiline="true" dlg:vscroll="true" dlg:help-text="One .md or .txt path per line."/>
+    <dlg:button dlg:id="add_reference_files" dlg:tab-index="38" dlg:left="218" dlg:top="332" dlg:width="42" dlg:height="14" dlg:value="Add...">
+      <script:event script:event-name="on-performaction" script:macro-name="vnd.sun.star.UNO:add_reference_files" script:language="UNO"/>
+    </dlg:button>
+    <dlg:button dlg:id="clear_reference_files" dlg:tab-index="39" dlg:left="218" dlg:top="350" dlg:width="42" dlg:height="14" dlg:value="Clear">
+      <script:event script:event-name="on-performaction" script:macro-name="vnd.sun.star.UNO:clear_reference_files" script:language="UNO"/>
+    </dlg:button>
   </dlg:bulletinboard>
 </dlg:window>

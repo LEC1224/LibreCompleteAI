@@ -32,11 +32,32 @@ class ExtensionMetadataTests(unittest.TestCase):
         self.assertIn("full path", executable.attrib[f"{{{ns['dlg']}}}help-text"])
         self.assertIn("leave empty", model.attrib[f"{{{ns['dlg']}}}help-text"])
 
-    def test_extension_version_is_0_2_3(self):
+    def test_options_dialog_exposes_reference_file_controls(self):
+        tree = ET.parse(OPTIONS_DIALOG)
+        ns = {
+            "dlg": "http://openoffice.org/2000/dialog",
+            "script": "http://openoffice.org/2000/script",
+        }
+        paths = tree.find(".//*[@dlg:id='reference_files']", ns)
+        add_button = tree.find(".//*[@dlg:id='add_reference_files']", ns)
+        clear_button = tree.find(".//*[@dlg:id='clear_reference_files']", ns)
+        self.assertIsNotNone(paths)
+        self.assertEqual(paths.attrib[f"{{{ns['dlg']}}}multiline"], "true")
+        self.assertIn(".md", paths.attrib[f"{{{ns['dlg']}}}help-text"])
+        self.assertEqual(
+            add_button.find("script:event", ns).attrib[f"{{{ns['script']}}}macro-name"],
+            "vnd.sun.star.UNO:add_reference_files",
+        )
+        self.assertEqual(
+            clear_button.find("script:event", ns).attrib[f"{{{ns['script']}}}macro-name"],
+            "vnd.sun.star.UNO:clear_reference_files",
+        )
+
+    def test_extension_version_is_0_2_4(self):
         tree = ET.parse(DESCRIPTION)
         ns = {"desc": "http://openoffice.org/extensions/description/2006"}
         version = tree.find("desc:version", ns)
-        self.assertEqual(version.attrib["value"], "0.2.3")
+        self.assertEqual(version.attrib["value"], "0.2.4")
 
     def test_manifest_exports_python_scripts_to_script_provider(self):
         tree = ET.parse(MANIFEST)

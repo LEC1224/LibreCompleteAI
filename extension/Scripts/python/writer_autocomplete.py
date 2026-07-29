@@ -1,4 +1,5 @@
 import json
+import locale
 import math
 import os
 import re
@@ -8,12 +9,13 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 try:
     import uno
     import unohelper
-    from com.sun.star.awt import XAdjustmentListener, XKeyHandler
+    from com.sun.star.awt import XActionListener, XAdjustmentListener, XKeyHandler
     from com.sun.star.awt.FontSlant import ITALIC
     from com.sun.star.awt.Key import ESCAPE, RIGHT, TAB
     from com.sun.star.awt.KeyModifier import MOD1
@@ -31,6 +33,9 @@ except Exception:
     unohelper = _UnoHelper()
 
     class XKeyHandler(object):
+        pass
+
+    class XActionListener(object):
         pass
 
     class XAdjustmentListener(object):
@@ -68,6 +73,7 @@ DEFAULT_SETTINGS = {
     "max_context_words": "600",
     "prefix_chars": "2400",
     "writing_guidance": "Match the author's language, tone, point of view, and pacing.",
+    "reference_files": "",
 }
 
 SYSTEM_PROMPT = """You are an inline autocomplete engine for prose in LibreOffice Writer.
@@ -132,6 +138,9 @@ SUMMARY_REFRESH_WORDS = 120
 SUMMARY_RECENT_MIN_WORDS = 80
 SUMMARY_RECENT_RATIO = 0.5
 MAX_CONTEXT_CHAR_CAP = 80000
+MAX_REFERENCE_FILES = 20
+MAX_REFERENCE_CONTEXT_CHARS = 48000
+REFERENCE_FILE_EXTENSIONS = (".md", ".txt")
 MAX_REJECTED_COMPLETIONS = 3
 REVISION_CONTEXT_WORDS = 10
 REVISION_CONTEXT_CHAR_FALLBACK = 2000
@@ -167,6 +176,7 @@ SETTINGS_FIELDS = (
     "max_context_words",
     "prefix_chars",
     "writing_guidance",
+    "reference_files",
 )
 INTEGER_SETTINGS = (
     "max_tokens",
@@ -221,8 +231,12 @@ def normalize_settings(settings):
         ollama_mode = "auto"
     merged["ollama_completion_mode"] = ollama_mode
 
+    reference_files = merged.get("reference_files", "")
     for key in SETTINGS_FIELDS:
+        if key == "reference_files":
+            continue
         merged[key] = str(merged.get(key, DEFAULT_SETTINGS[key])).strip()
+    merged["reference_files"] = _reference_files_setting_value(reference_files)
 
     for key in INTEGER_SETTINGS:
         merged[key] = str(_parse_integer(merged[key], DEFAULT_SETTINGS[key]))
@@ -231,6 +245,35 @@ def normalize_settings(settings):
     )
 
     return merged
+
+
+def _reference_file_paths(value):
+    if isinstance(value, (list, tuple)):
+        candidates = value
+    else:
+        candidates = str(value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    paths = []
+    seen = set()
+    for candidate in candidates:
+        path = str(candidate or "").strip()
+        if len(path) >= 2 and path[0] == path[-1] and path[0] in ("'", '"'):
+            path = path[1:-1].strip()
+        if not path or os.path.splitext(path)[1].lower() not in REFERENCE_FILE_EXTENSIONS:
+            continue
+        path = os.path.abspath(os.path.expanduser(path))
+        dedupe_key = os.path.normcase(os.path.normpath(path))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        paths.append(path)
+        if len(paths) >= MAX_REFERENCE_FILES:
+            break
+    return tuple(paths)
+
+
+def _reference_files_setting_value(value):
+    return "\n".join(_reference_file_paths(value))
 
 
 def load_settings():
@@ -318,6 +361,66 @@ def _summary_token_limit(settings):
     return max(96, min(512, max_context_words // 2))
 
 
+def _read_reference_file(path):
+    if os.path.splitext(path)[1].lower() not in REFERENCE_FILE_EXTENSIONS:
+        return ""
+
+    encodings = ("utf-8-sig", "utf-16", locale.getpreferredencoding(False))
+    tried = set()
+    for encoding in encodings:
+        if not encoding or encoding.lower() in tried:
+            continue
+        tried.add(encoding.lower())
+        try:
+            with open(path, "r", encoding=encoding) as handle:
+                return handle.read(MAX_REFERENCE_CONTEXT_CHARS + 1).replace("\r\n", "\n").replace("\r", "\n")
+        except (UnicodeError, LookupError):
+            continue
+        except OSError:
+            return ""
+    return ""
+
+
+def _reference_context_block(settings):
+    loaded = []
+    for path in _reference_file_paths(settings.get("reference_files", "")):
+        content = _read_reference_file(path).strip()
+        if content:
+            loaded.append((os.path.basename(path) or path, content))
+
+    sections = []
+    remaining_chars = MAX_REFERENCE_CONTEXT_CHARS
+    remaining_files = len(loaded)
+    for filename, content in loaded:
+        fair_share = max(1, remaining_chars // remaining_files)
+        truncated = len(content) > fair_share
+        included = content[:fair_share].rstrip()
+        if truncated:
+            included += "\n[Reference file truncated to fit the autocomplete context limit.]"
+        sections.append(
+            f"Reference file: {filename}\n"
+            "<reference>\n"
+            f"{included}\n"
+            "</reference>"
+        )
+        remaining_chars -= min(len(content), fair_share)
+        remaining_files -= 1
+
+    return "\n\n".join(sections)
+
+
+def _reference_prompt_section(settings):
+    reference_context = _reference_context_block(settings)
+    if not reference_context:
+        return ""
+    return (
+        "Reference material:\n"
+        "Use these canon, character, and world-building notes as background. Keep the continuation consistent "
+        "with them, but do not treat their prose as part of the document or copy it unless that is natural.\n"
+        f"{reference_context}\n\n"
+    )
+
+
 def build_messages(prefix, suffix, settings, regeneration=None, structured=False):
     # `suffix` remains in the internal signature for compatibility with older
     # callers, but text after the cursor is intentionally never sent to a
@@ -325,6 +428,7 @@ def build_messages(prefix, suffix, settings, regeneration=None, structured=False
     max_words = _prediction_words(settings)
     min_words = max(1, int(math.floor(max_words * 0.8)))
     guidance = settings.get("writing_guidance") or DEFAULT_SETTINGS["writing_guidance"]
+    reference_section = _reference_prompt_section(settings)
     reasoning_instruction = _reasoning_instruction(settings)
     regeneration_instruction = _regeneration_instruction(regeneration, max_words)
     length_instruction = (
@@ -349,6 +453,7 @@ def build_messages(prefix, suffix, settings, regeneration=None, structured=False
         "Continue the document at <cursor>.\n\n"
         "Writing guidance:\n"
         f"{guidance}\n\n"
+        f"{reference_section}"
         f"{reasoning_instruction}\n\n"
         f"{regeneration_instruction}"
         "Text before <cursor>:\n"
@@ -1162,7 +1267,19 @@ def _is_ollama_guided_unsupported(error):
 
 
 def _ollama_completion_prompt(prefix, suffix, settings):
-    return prefix or ""
+    reference_section = _reference_prompt_section(settings)
+    if not reference_section:
+        return prefix or ""
+    guidance = settings.get("writing_guidance") or DEFAULT_SETTINGS["writing_guidance"]
+    return (
+        "Continue the document after its final character. Follow the writing guidance and keep the continuation "
+        "consistent with the reference material.\n\n"
+        "Writing guidance:\n"
+        f"{guidance}\n\n"
+        f"{reference_section}"
+        "Document text:\n"
+        f"{prefix or ''}"
+    )
 
 
 def _ollama_completion_stop_sequences(settings):
@@ -2504,7 +2621,7 @@ def _create_settings_dialog(ctx, settings):
     model.PositionX = 80
     model.PositionY = 80
     model.Width = 285
-    model.Height = 370
+    model.Height = 430
     model.Title = "LibreCompleteAI Settings"
 
     y = 10
@@ -2600,14 +2717,32 @@ def _create_settings_dialog(ctx, settings):
     guidance.MultiLine = True
     guidance.VScroll = True
 
-    _button(model, "ok", 168, 346, 45, "OK", 1)
-    _button(model, "cancel", 218, 346, 45, "Cancel", 2)
+    y += 44
+    _label(model, "reference_files_label", 10, y, 70, "Reference files")
+    reference_files = _control(
+        model,
+        "com.sun.star.awt.UnoControlListBoxModel",
+        "reference_files",
+        88,
+        y - 2,
+        175,
+        54,
+    )
+    reference_files.StringItemList = _reference_file_paths(settings.get("reference_files", ""))
+    reference_files.MultiSelection = True
+    _button(model, "add_reference_files", 10, y + 14, 70, "Add files...", 0)
+    _button(model, "remove_reference_files", 10, y + 32, 70, "Remove", 0)
+
+    _button(model, "ok", 168, 406, 45, "OK", 1)
+    _button(model, "cancel", 218, 406, 45, "Cancel", 2)
 
     dialog = smgr.createInstanceWithContext("com.sun.star.awt.UnoControlDialog", ctx)
     dialog.setModel(model)
     toolkit = smgr.createInstanceWithContext("com.sun.star.awt.Toolkit", ctx)
     dialog.createPeer(toolkit, None)
-    _DIALOG_LISTENERS[id(dialog)] = _connect_slider_listeners(dialog)
+    _DIALOG_LISTENERS[id(dialog)] = (
+        _connect_slider_listeners(dialog) + _connect_reference_file_listeners(ctx, dialog)
+    )
     return dialog
 
 
@@ -2621,6 +2756,8 @@ def _settings_from_dialog(dialog, current):
             continue
         if name in BOOLEAN_SETTINGS:
             updated[name] = _get_dialog_bool(dialog, name, current.get(name, "false"))
+        elif name == "reference_files":
+            updated[name] = _reference_files_setting_value(_get_reference_file_items(dialog))
         else:
             updated[name] = _get_dialog_text(dialog, name, current.get(name, DEFAULT_SETTINGS.get(name, "")))
     return normalize_settings(updated)
@@ -2699,6 +2836,145 @@ def _get_dialog_bool(dialog, name, default="false"):
     return "true" if _control_state(control, default) else "false"
 
 
+def _get_reference_file_items(dialog):
+    try:
+        control = dialog.getControl("reference_files")
+    except Exception:
+        return ()
+    for getter in (
+        lambda: control.getItems(),
+        lambda: control.getModel().StringItemList,
+    ):
+        try:
+            return tuple(str(item) for item in getter())
+        except Exception:
+            pass
+    return ()
+
+
+def _set_reference_file_items(dialog, paths):
+    paths = _reference_file_paths(paths)
+    try:
+        control = dialog.getControl("reference_files")
+    except Exception:
+        return
+    for setter in (
+        lambda: setattr(control.getModel(), "StringItemList", paths),
+        lambda: _replace_list_box_items(control, paths),
+    ):
+        try:
+            setter()
+            return
+        except Exception:
+            pass
+
+
+def _replace_list_box_items(control, paths):
+    try:
+        count = int(control.getItemCount())
+    except Exception:
+        count = 0
+    if count:
+        control.removeItems(0, count)
+    if paths:
+        control.addItems(tuple(paths), 0)
+
+
+def _selected_reference_file_positions(dialog):
+    try:
+        control = dialog.getControl("reference_files")
+    except Exception:
+        return ()
+    for getter in (
+        lambda: control.getSelectedItemsPos(),
+        lambda: control.getModel().SelectedItems,
+    ):
+        try:
+            return tuple(int(position) for position in getter())
+        except Exception:
+            pass
+    return ()
+
+
+def _pick_reference_files(ctx, current_paths=()):
+    if not ctx:
+        return ()
+    picker = ctx.ServiceManager.createInstanceWithContext(
+        "com.sun.star.ui.dialogs.FilePicker",
+        ctx,
+    )
+    try:
+        try:
+            picker.initialize((0,))
+        except Exception:
+            pass
+        picker.setTitle("Choose prose reference files")
+        picker.setMultiSelectionMode(True)
+        try:
+            picker.appendFilter("Markdown and text files", "*.md;*.txt")
+            picker.appendFilter("Markdown files", "*.md")
+            picker.appendFilter("Text files", "*.txt")
+            picker.setCurrentFilter("Markdown and text files")
+        except Exception:
+            pass
+
+        for path in _reference_file_paths(current_paths):
+            directory = os.path.dirname(path)
+            if not os.path.isdir(directory):
+                continue
+            try:
+                picker.setDisplayDirectory(_system_path_to_file_url(directory))
+            except Exception:
+                pass
+            break
+
+        if picker.execute() != 1:
+            return ()
+        for getter in (
+            lambda: picker.getSelectedFiles(),
+            lambda: picker.getFiles(),
+        ):
+            try:
+                selected = tuple(getter())
+                if selected:
+                    return _reference_file_paths(
+                        tuple(_file_url_to_system_path(item) for item in selected)
+                    )
+            except Exception:
+                pass
+        return ()
+    finally:
+        try:
+            picker.dispose()
+        except Exception:
+            pass
+
+
+def _file_url_to_system_path(value):
+    value = str(value or "")
+    if not value.lower().startswith("file:"):
+        return value
+    if uno is not None:
+        try:
+            return uno.fileUrlToSystemPath(value)
+        except Exception:
+            pass
+    parsed = urllib.parse.urlparse(value)
+    path = urllib.request.url2pathname(parsed.path)
+    if parsed.netloc:
+        path = f"//{parsed.netloc}{path}"
+    return path
+
+
+def _system_path_to_file_url(path):
+    if uno is not None:
+        try:
+            return uno.systemPathToFileUrl(os.path.abspath(path))
+        except Exception:
+            pass
+    return urllib.parse.urljoin("file:", urllib.request.pathname2url(os.path.abspath(path)))
+
+
 def _control_text(control, default=""):
     for getter in (
         lambda: control.getText(),
@@ -2757,6 +3033,49 @@ def _connect_slider_listeners(dialog):
         except Exception:
             pass
     return listeners
+
+
+def _connect_reference_file_listeners(ctx, dialog):
+    listeners = []
+    for control_name, action in (
+        ("add_reference_files", "add"),
+        ("remove_reference_files", "remove"),
+    ):
+        try:
+            listener = _ReferenceFileActionListener(ctx, dialog, action)
+            dialog.getControl(control_name).addActionListener(listener)
+            listeners.append(listener)
+        except Exception:
+            pass
+    return listeners
+
+
+class _ReferenceFileActionListener(unohelper.Base, XActionListener):
+    def __init__(self, ctx, dialog, action):
+        self.ctx = ctx
+        self.dialog = dialog
+        self.action = action
+
+    def actionPerformed(self, event):
+        if self.dialog is None:
+            return
+        current = _get_reference_file_items(self.dialog)
+        if self.action == "add":
+            selected = _pick_reference_files(self.ctx, current)
+            if selected:
+                _set_reference_file_items(self.dialog, current + selected)
+            return
+
+        selected_positions = set(_selected_reference_file_positions(self.dialog))
+        if selected_positions:
+            _set_reference_file_items(
+                self.dialog,
+                tuple(path for index, path in enumerate(current) if index not in selected_positions),
+            )
+
+    def disposing(self, event):
+        self.dialog = None
+        self.ctx = None
 
 
 class _SliderToTextListener(unohelper.Base, XAdjustmentListener):
