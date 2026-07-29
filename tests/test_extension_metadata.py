@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "extension" / "META-INF" / "manifest.xml"
+DESCRIPTION = ROOT / "extension" / "description.xml"
 ADDONS = ROOT / "extension" / "Addons.xcu"
 WRITER_WINDOW_STATE = ROOT / "extension" / "WriterWindowState.xcu"
 OPTIONS_DIALOG = ROOT / "extension" / "options" / "LibreCompleteAI.xdl"
@@ -19,6 +20,23 @@ class ExtensionMetadataTests(unittest.TestCase):
         self.assertIsNotNone(control)
         self.assertEqual(control.attrib[f"{{{ns['dlg']}}}value"], "auto")
         self.assertIn("guided", control.attrib[f"{{{ns['dlg']}}}help-text"])
+
+    def test_options_dialog_exposes_codex_provider_settings(self):
+        tree = ET.parse(OPTIONS_DIALOG)
+        ns = {"dlg": "http://openoffice.org/2000/dialog"}
+        provider = tree.find(".//*[@dlg:id='provider']", ns)
+        executable = tree.find(".//*[@dlg:id='codex_executable']", ns)
+        model = tree.find(".//*[@dlg:id='codex_model']", ns)
+        self.assertIn("codex", provider.attrib[f"{{{ns['dlg']}}}help-text"])
+        self.assertEqual(executable.attrib[f"{{{ns['dlg']}}}value"], "codex")
+        self.assertIn("full path", executable.attrib[f"{{{ns['dlg']}}}help-text"])
+        self.assertIn("leave empty", model.attrib[f"{{{ns['dlg']}}}help-text"])
+
+    def test_extension_version_is_0_2_3(self):
+        tree = ET.parse(DESCRIPTION)
+        ns = {"desc": "http://openoffice.org/extensions/description/2006"}
+        version = tree.find("desc:version", ns)
+        self.assertEqual(version.attrib["value"], "0.2.3")
 
     def test_manifest_exports_python_scripts_to_script_provider(self):
         tree = ET.parse(MANIFEST)

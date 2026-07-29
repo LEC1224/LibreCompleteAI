@@ -33,8 +33,23 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(settings["allow_reasoning"], "false")
         self.assertEqual(settings["ollama_model"], "qwen3.5:4b")
         self.assertEqual(settings["ollama_completion_mode"], "auto")
+        self.assertEqual(settings["codex_executable"], "codex")
+        self.assertEqual(settings["codex_model"], "")
         self.assertEqual(settings["max_context_words"], "600")
         self.assertEqual(settings["prediction_words"], "24")
+
+    def test_normalize_settings_accepts_codex_provider(self):
+        module = load_module()
+        settings = module.normalize_settings(
+            {
+                "provider": "Codex",
+                "codex_executable": "C:/Tools/codex.exe",
+                "codex_model": "gpt-5.4",
+            }
+        )
+        self.assertEqual(settings["provider"], "codex")
+        self.assertEqual(settings["codex_executable"], "C:/Tools/codex.exe")
+        self.assertEqual(settings["codex_model"], "gpt-5.4")
 
     def test_normalize_settings_does_not_copy_env_api_key(self):
         module = load_module()
@@ -725,6 +740,77 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(payload["max_completion_tokens"], 32)
         self.assertEqual(payload["reasoning_effort"], "minimal")
         self.assertNotIn("max_tokens", payload)
+
+    def test_request_codex_uses_saved_login_and_constrained_exec(self):
+        module = load_module()
+        calls = []
+
+        class Result:
+            returncode = 0
+            stdout = '{"completion":"the next line"}\n'
+            stderr = ""
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return Result()
+
+        original_run = module.subprocess.run
+        original_resolve = module._resolve_codex_executable
+        original_codex_key = os.environ.get("CODEX_API_KEY")
+        original_openai_key = os.environ.get("OPENAI_API_KEY")
+        module.subprocess.run = fake_run
+        module._resolve_codex_executable = lambda configured: "C:/Tools/codex.exe"
+        os.environ["CODEX_API_KEY"] = "must-not-be-inherited"
+        os.environ["OPENAI_API_KEY"] = "must-not-be-inherited"
+        try:
+            settings = module.normalize_settings(
+                {
+                    "provider": "codex",
+                    "codex_executable": "C:/Tools/codex.exe",
+                    "codex_model": "gpt-5.4",
+                    "allow_reasoning": "false",
+                }
+            )
+            completion = module.request_completion(
+                "Wings thundered above Elian.",
+                "This after-cursor text must not be sent.",
+                settings,
+            )
+        finally:
+            module.subprocess.run = original_run
+            module._resolve_codex_executable = original_resolve
+            if original_codex_key is None:
+                os.environ.pop("CODEX_API_KEY", None)
+            else:
+                os.environ["CODEX_API_KEY"] = original_codex_key
+            if original_openai_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = original_openai_key
+
+        self.assertEqual(completion, "the next line")
+        command, kwargs = calls[0]
+        self.assertEqual(command[:2], ["C:/Tools/codex.exe", "exec"])
+        self.assertIn("--ephemeral", command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertIn("--sandbox", command)
+        self.assertIn("read-only", command)
+        self.assertIn('web_search="disabled"', command)
+        self.assertIn('model_reasoning_effort="low"', command)
+        self.assertEqual(command[-1], "-")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.4")
+        self.assertTrue(Path(command[command.index("--output-schema") + 1]).is_file())
+        self.assertIn("Wings thundered above Elian.", kwargs["input"])
+        self.assertNotIn("This after-cursor text must not be sent.", kwargs["input"])
+        self.assertNotIn("CODEX_API_KEY", kwargs["env"])
+        self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
+        self.assertNotEqual(kwargs["cwd"], str(Path.cwd()))
+
+    def test_request_codex_rejects_unstructured_output(self):
+        module = load_module()
+        with self.assertRaisesRegex(RuntimeError, "structured output"):
+            module._extract_codex_completion("not json")
 
     def test_request_openai_skips_reasoning_effort_when_allowed(self):
         module = load_module()
@@ -1483,6 +1569,28 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertTrue(calls[0][0].endswith("/api/chat"))
         self.assertEqual(calls[0][1]["format"], module.OLLAMA_COMPLETION_SCHEMA)
         prompt = "\n".join(message["content"] for message in calls[0][1]["messages"])
+        self.assertIn("The opening sentence.", prompt)
+        self.assertIn("The next sentence.", prompt)
+
+    def test_request_revision_routes_through_codex(self):
+        module = load_module()
+        calls = []
+        original = module._request_codex_messages
+        module._request_codex_messages = lambda messages, settings: (
+            calls.append(messages) or "A corrected phrase."
+        )
+        try:
+            revision = module.request_revision(
+                "A corected phrase.",
+                "The opening sentence.",
+                "The next sentence.",
+                module.normalize_settings({"provider": "codex"}),
+            )
+        finally:
+            module._request_codex_messages = original
+
+        self.assertEqual(revision, "A corrected phrase.")
+        prompt = "\n".join(message["content"] for message in calls[0])
         self.assertIn("The opening sentence.", prompt)
         self.assertIn("The next sentence.", prompt)
 

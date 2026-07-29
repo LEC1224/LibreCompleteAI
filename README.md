@@ -4,7 +4,7 @@
 
 Bring Cursor-style AI autocomplete to LibreOffice Writer. LibreCompleteAI helps you stay in the flow by suggesting natural prose continuations directly at the cursor, previewed as subtle ghost text you can accept with Tab or ignore by simply continuing to write.
 
-It is built for drafting, editing, and long-form writing: essays, articles, fiction, reports, notes, and any document where the next sentence matters more than the next line of code. Use OpenAI-compatible models with your own API key, or keep everything local with Ollama.
+It is built for drafting, editing, and long-form writing: essays, articles, fiction, reports, notes, and any document where the next sentence matters more than the next line of code. Use OpenAI-compatible models with your own API key, keep everything local with Ollama, or connect through an existing Codex login without configuring an API key in LibreCompleteAI.
 
 LibreCompleteAI is a LibreOffice Writer extension that uses an LLM to continue prose at the cursor when you press Tab. It is aimed at drafting, editing, and long-form writing rather than code completion.
 
@@ -14,6 +14,7 @@ It is intended for LibreOffice 7.0 or newer.
 
 - OpenAI-compatible chat completions with an API key, base URL, and model label.
 - Ollama at a local or remote host, using any model you have downloaded.
+- Codex CLI access that reuses an existing Codex/ChatGPT login instead of storing an API key in the extension.
 - A LibreOffice settings dialog for provider and generation options.
 - A compact `LC-AI` Writer toolbar with short text buttons for toggling LC-AI, continuous suggestions, completion, and settings.
 - A fallback "Complete Now" command if you want to test completion without enabling the Tab hook.
@@ -83,6 +84,15 @@ For Ollama use, set:
 - Host, usually `http://localhost:11434`
 - Model label, matching a local model from `ollama list`. `qwen3.5:4b` is the default and a good responsive starting point for GPUs with roughly 6–10 GB of available VRAM.
 - Ollama mode: `auto` (recommended), `guided`, or `raw`.
+
+For Codex use:
+
+1. Install a current Codex CLI with `codex exec` structured-output support and run `codex login` in a terminal. A ChatGPT login lets LibreCompleteAI use your Codex access without an API key in the extension.
+2. Set Provider to `Codex`.
+3. Leave Codex executable as `codex` when it is on LibreOffice's `PATH`, or enter the full path to the Codex executable.
+4. Optionally set a Codex model. Leave it empty to use Codex's current default model.
+
+Each Codex request starts a non-interactive, ephemeral session that reuses the CLI's saved login. LibreCompleteAI disables Codex web search, ignores Codex user configuration and rules, uses a temporary empty working directory, requests a read-only sandbox, and instructs Codex not to call tools. The document context and generated result are still sent to OpenAI through Codex. The Codex provider does not use the Temperature or Token cap fields; Prediction words remains enforced by the prompt and LibreCompleteAI's local output filter.
 
 Generation controls:
 

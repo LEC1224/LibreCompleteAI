@@ -63,6 +63,19 @@ class OptionsHandlerTests(unittest.TestCase):
             "auto",
         )
 
+    def test_normalize_settings_accepts_codex_provider(self):
+        module = load_module()
+        settings = module.normalize_settings(
+            {
+                "provider": "Codex",
+                "codex_executable": "C:/Tools/codex.exe",
+                "codex_model": "gpt-5.4",
+            }
+        )
+        self.assertEqual(settings["provider"], "codex")
+        self.assertEqual(settings["codex_executable"], "C:/Tools/codex.exe")
+        self.assertEqual(settings["codex_model"], "gpt-5.4")
+
     def test_normalize_settings_does_not_copy_env_api_key(self):
         module = load_module()
         original = os.environ.get("OPENAI_API_KEY")

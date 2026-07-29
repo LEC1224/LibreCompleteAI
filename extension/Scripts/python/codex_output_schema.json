@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "completion": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "completion"
+  ],
+  "additionalProperties": false
+}

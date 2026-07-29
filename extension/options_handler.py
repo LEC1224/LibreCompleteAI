@@ -63,6 +63,8 @@ DEFAULT_SETTINGS = {
     "ollama_host": "http://localhost:11434",
     "ollama_model": "qwen3.5:4b",
     "ollama_completion_mode": "auto",
+    "codex_executable": "codex",
+    "codex_model": "",
     "temperature": "0.45",
     "max_tokens": "96",
     "prediction_words": "24",
@@ -80,6 +82,8 @@ SETTINGS_FIELDS = (
     "ollama_host",
     "ollama_model",
     "ollama_completion_mode",
+    "codex_executable",
+    "codex_model",
     "temperature",
     "max_tokens",
     "prediction_words",
@@ -101,6 +105,7 @@ SLIDER_SETTINGS = {
     "prediction_words": "prediction_words_slider",
 }
 OLLAMA_COMPLETION_MODES = ("auto", "guided", "raw")
+SUPPORTED_PROVIDERS = ("openai", "ollama", "codex")
 
 
 def _config_dir():
@@ -124,7 +129,7 @@ def normalize_settings(settings):
     merged.pop("suffix_chars", None)
 
     provider = str(merged.get("provider", "openai")).strip().lower()
-    if provider not in ("openai", "ollama"):
+    if provider not in SUPPORTED_PROVIDERS:
         provider = "openai"
     merged["provider"] = provider
 
