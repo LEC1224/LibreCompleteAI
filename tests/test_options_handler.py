@@ -45,12 +45,22 @@ class OptionsHandlerTests(unittest.TestCase):
         settings = module.normalize_settings({"provider": "bad", "suffix_chars": "999"})
         self.assertEqual(settings["provider"], "openai")
         self.assertNotIn("suffix_chars", settings)
+        self.assertEqual(settings["autocomplete_enabled"], "false")
         self.assertEqual(settings["continuous_suggestions"], "false")
         self.assertEqual(settings["allow_reasoning"], "false")
         self.assertEqual(settings["ollama_model"], "qwen3.5:4b")
         self.assertEqual(settings["ollama_completion_mode"], "auto")
         self.assertEqual(settings["max_context_words"], "600")
         self.assertEqual(settings["reference_files"], "")
+
+    def test_normalize_settings_preserves_internal_autocomplete_state(self):
+        module = load_module()
+        self.assertEqual(
+            module.normalize_settings({"autocomplete_enabled": "yes"})[
+                "autocomplete_enabled"
+            ],
+            "true",
+        )
 
     def test_normalize_settings_keeps_only_unique_text_reference_files(self):
         module = load_module()
@@ -194,6 +204,17 @@ class OptionsHandlerTests(unittest.TestCase):
         self.assertTrue(listener.events[0].State.bVisible)
         self.assertTrue(listener.events[1].IsEnabled)
         self.assertTrue(listener.events[1].State)
+
+    def test_status_listener_restores_saved_state_before_first_toolbar_update(self):
+        module = load_module()
+        dispatch = module.LibreCompleteAIDispatch(ctx=None)
+        calls = []
+        dispatch._restore_saved_autocomplete_state = lambda: calls.append("restore")
+        dispatch._notify_listener = lambda listener, url: calls.append("notify")
+
+        dispatch.addStatusListener(object(), object())
+
+        self.assertEqual(calls, ["restore", "notify"])
 
 
 if __name__ == "__main__":

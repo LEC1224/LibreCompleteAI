@@ -18,6 +18,7 @@ It is intended for LibreOffice 7.0 or newer.
 - A LibreOffice settings dialog for provider and generation options.
 - One or more Markdown or plain-text reference files for canon, character notes, and world-building context.
 - A compact `LC-AI` Writer toolbar with short text buttons for toggling LC-AI, continuous suggestions, completion, and settings.
+- The main LC-AI enabled state is remembered and restored automatically for each Writer window on the next startup.
 - A fallback "Complete Now" command if you want to test completion without enabling the Tab hook.
 - A ghost-text style preview: press Tab once to preview, press Tab again to accept.
 - Selected-text grammar, spelling, and wording revisions with optional square-bracketed editing guidance.

@@ -30,6 +30,7 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(settings["provider"], "openai")
         self.assertNotIn("suffix_chars", settings)
         self.assertEqual(settings["openai_base_url"], "https://api.openai.com/v1")
+        self.assertEqual(settings["autocomplete_enabled"], "false")
         self.assertEqual(settings["continuous_suggestions"], "false")
         self.assertEqual(settings["allow_reasoning"], "false")
         self.assertEqual(settings["ollama_model"], "qwen3.5:4b")
@@ -39,6 +40,98 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(settings["max_context_words"], "600")
         self.assertEqual(settings["prediction_words"], "24")
         self.assertEqual(settings["reference_files"], "")
+
+    def test_normalize_settings_accepts_persisted_autocomplete_state(self):
+        module = load_module()
+        self.assertEqual(
+            module.normalize_settings({"autocomplete_enabled": True})["autocomplete_enabled"],
+            "true",
+        )
+        self.assertEqual(
+            module.normalize_settings({"autocomplete_enabled": "off"})["autocomplete_enabled"],
+            "false",
+        )
+
+    def test_autocomplete_preference_roundtrips_through_settings(self):
+        module = load_module()
+        stored = module.normalize_settings({"autocomplete_enabled": "false"})
+        original_load = module.load_settings
+        original_save = module.save_settings
+        module.load_settings = lambda: dict(stored)
+
+        def fake_save(settings):
+            stored.clear()
+            stored.update(module.normalize_settings(settings))
+            return dict(stored)
+
+        module.save_settings = fake_save
+        try:
+            self.assertTrue(module.set_autocomplete_preference(True))
+            self.assertTrue(module.is_autocomplete_preferred())
+            self.assertFalse(module.set_autocomplete_preference(False))
+            self.assertFalse(module.is_autocomplete_preferred())
+        finally:
+            module.load_settings = original_load
+            module.save_settings = original_save
+
+    def test_restore_autocomplete_enables_only_when_preferred(self):
+        module = load_module()
+        doc = object()
+        enabled = []
+        original_load = module.load_settings
+        original_enable = module.enable_autocomplete_for_doc
+        module.enable_autocomplete_for_doc = lambda current_doc: enabled.append(current_doc) or True
+        try:
+            module.load_settings = lambda: module.normalize_settings(
+                {"autocomplete_enabled": "true"}
+            )
+            self.assertTrue(module.restore_autocomplete_for_doc(doc))
+            self.assertEqual(enabled, [doc])
+
+            module.load_settings = lambda: module.normalize_settings(
+                {"autocomplete_enabled": "false"}
+            )
+            self.assertFalse(module.restore_autocomplete_for_doc(doc))
+            self.assertEqual(enabled, [doc])
+        finally:
+            module.load_settings = original_load
+            module.enable_autocomplete_for_doc = original_enable
+
+    def test_toggle_autocomplete_remembers_each_resulting_mode(self):
+        module = load_module()
+
+        class Doc:
+            pass
+
+        doc = Doc()
+        key = module._doc_key(doc)
+        preferences = []
+        original_enable = module.enable_autocomplete_for_doc
+        original_disable = module.disable_autocomplete_for_doc
+        original_preference = module.set_autocomplete_preference
+
+        def fake_enable(current_doc, notify=False):
+            module._HANDLERS[key] = (object(), object())
+            return True
+
+        def fake_disable(current_doc, notify=False):
+            module._HANDLERS.pop(key, None)
+            return True
+
+        module.enable_autocomplete_for_doc = fake_enable
+        module.disable_autocomplete_for_doc = fake_disable
+        module.set_autocomplete_preference = lambda enabled: preferences.append(enabled)
+        module._HANDLERS.pop(key, None)
+        try:
+            self.assertTrue(module.toggle_autocomplete_for_doc(doc))
+            self.assertFalse(module.toggle_autocomplete_for_doc(doc))
+        finally:
+            module._HANDLERS.pop(key, None)
+            module.enable_autocomplete_for_doc = original_enable
+            module.disable_autocomplete_for_doc = original_disable
+            module.set_autocomplete_preference = original_preference
+
+        self.assertEqual(preferences, [True, False])
 
     def test_normalize_settings_keeps_unique_markdown_and_text_reference_files(self):
         module = load_module()

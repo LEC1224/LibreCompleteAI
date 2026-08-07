@@ -68,6 +68,7 @@ DEFAULT_SETTINGS = {
     "temperature": "0.45",
     "max_tokens": "96",
     "prediction_words": "24",
+    "autocomplete_enabled": "false",
     "continuous_suggestions": "false",
     "allow_reasoning": "false",
     "max_context_words": "600",
@@ -230,6 +231,9 @@ def normalize_settings(settings):
     if ollama_mode not in OLLAMA_COMPLETION_MODES:
         ollama_mode = "auto"
     merged["ollama_completion_mode"] = ollama_mode
+
+    enabled_value = str(merged.get("autocomplete_enabled", "false")).strip().lower()
+    merged["autocomplete_enabled"] = "true" if enabled_value in ("1", "true", "yes", "on") else "false"
 
     reference_files = merged.get("reference_files", "")
     for key in SETTINGS_FIELDS:
@@ -2499,6 +2503,23 @@ def is_autocomplete_enabled(doc=None):
     return _doc_key(doc) in _HANDLERS
 
 
+def is_autocomplete_preferred(settings=None):
+    return _bool_setting(settings or load_settings(), "autocomplete_enabled")
+
+
+def set_autocomplete_preference(enabled):
+    settings = load_settings()
+    settings["autocomplete_enabled"] = "true" if enabled else "false"
+    save_settings(settings)
+    return bool(enabled)
+
+
+def restore_autocomplete_for_doc(doc):
+    if not is_autocomplete_preferred():
+        return False
+    return enable_autocomplete_for_doc(doc)
+
+
 def enable_autocomplete_for_doc(doc, notify=False):
     if not _is_writer_document(doc):
         if notify:
@@ -2533,21 +2554,28 @@ def disable_autocomplete_for_doc(doc, notify=False):
     return True
 
 
-def toggle_autocomplete_for_doc(doc, notify=False):
+def toggle_autocomplete_for_doc(doc, notify=False, remember=True):
     if _doc_key(doc) in _HANDLERS:
         disable_autocomplete_for_doc(doc, notify=notify)
-        return False
-    return enable_autocomplete_for_doc(doc, notify=notify)
+        enabled = False
+    else:
+        enabled = enable_autocomplete_for_doc(doc, notify=notify)
+    if remember:
+        set_autocomplete_preference(enabled)
+    return enabled
 
 
 def enable_autocomplete(*args):
     doc = _current_document()
-    enable_autocomplete_for_doc(doc, notify=True)
+    enabled = enable_autocomplete_for_doc(doc, notify=True)
+    if enabled:
+        set_autocomplete_preference(True)
 
 
 def disable_autocomplete(*args):
     doc = _current_document()
     disable_autocomplete_for_doc(doc, notify=True)
+    set_autocomplete_preference(False)
 
 
 def toggle_autocomplete(*args):

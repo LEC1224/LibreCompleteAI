@@ -68,6 +68,7 @@ DEFAULT_SETTINGS = {
     "temperature": "0.45",
     "max_tokens": "96",
     "prediction_words": "24",
+    "autocomplete_enabled": "false",
     "continuous_suggestions": "false",
     "allow_reasoning": "false",
     "max_context_words": "600",
@@ -141,6 +142,9 @@ def normalize_settings(settings):
     if ollama_mode not in OLLAMA_COMPLETION_MODES:
         ollama_mode = "auto"
     merged["ollama_completion_mode"] = ollama_mode
+
+    enabled_value = str(merged.get("autocomplete_enabled", "false")).strip().lower()
+    merged["autocomplete_enabled"] = "true" if enabled_value in ("1", "true", "yes", "on") else "false"
 
     reference_files = merged.get("reference_files", "")
     for key in SETTINGS_FIELDS:
@@ -330,7 +334,8 @@ class LibreCompleteAIDispatch(unohelper.Base, XServiceInfo, XInitialization, XDi
         for arg in _flatten_initialization_args(args):
             if arg is not None:
                 self.frame = arg
-                return
+                break
+        self._restore_saved_autocomplete_state()
 
     def queryDispatch(self, url, target_frame_name, search_flags):
         if _url_command(url) in SUPPORTED_DISPATCH_COMMANDS:
@@ -362,6 +367,7 @@ class LibreCompleteAIDispatch(unohelper.Base, XServiceInfo, XInitialization, XDi
         self._notify_all()
 
     def addStatusListener(self, listener, url):
+        self._restore_saved_autocomplete_state()
         self.listeners.append((listener, url))
         self._notify_listener(listener, url)
 
@@ -419,6 +425,15 @@ class LibreCompleteAIDispatch(unohelper.Base, XServiceInfo, XInitialization, XDi
         if command == "continuous":
             return bool(runtime.is_continuous_suggestions_enabled())
         return False
+
+    def _restore_saved_autocomplete_state(self):
+        try:
+            runtime = _load_writer_runtime()
+            doc = self._current_writer_document(runtime)
+            if doc is not None:
+                runtime.restore_autocomplete_for_doc(doc)
+        except Exception:
+            pass
 
     def _has_writer_document(self):
         try:
