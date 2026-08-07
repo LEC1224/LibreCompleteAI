@@ -55,7 +55,7 @@ DISPATCH_PROTOCOL = "vnd.librecompleteai:"
 SUPPORTED_DISPATCH_COMMANDS = ("toggle", "continuous", "complete", "settings")
 SECONDARY_DISPATCH_COMMANDS = ("continuous", "complete", "settings")
 _RUNTIME_MODULE = None
-RUNTIME_VERSION = "0.2.12"
+RUNTIME_VERSION = "0.3.0"
 DEFAULT_SETTINGS = {
     "provider": "openai",
     "openai_api_key": "",

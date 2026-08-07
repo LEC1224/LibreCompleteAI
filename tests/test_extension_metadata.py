@@ -53,11 +53,11 @@ class ExtensionMetadataTests(unittest.TestCase):
             "vnd.sun.star.UNO:clear_reference_files",
         )
 
-    def test_extension_version_is_0_2_12(self):
+    def test_extension_version_is_0_3_0(self):
         tree = ET.parse(DESCRIPTION)
         ns = {"desc": "http://openoffice.org/extensions/description/2006"}
         version = tree.find("desc:version", ns)
-        self.assertEqual(version.attrib["value"], "0.2.12")
+        self.assertEqual(version.attrib["value"], "0.3.0")
 
     def test_manifest_exports_python_scripts_to_script_provider(self):
         tree = ET.parse(MANIFEST)
