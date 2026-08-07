@@ -16,6 +16,22 @@ def load_module():
 
 
 class OptionsHandlerTests(unittest.TestCase):
+    def test_writer_runtime_is_compiled_from_source_without_creating_bytecode(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handler = root / "options_handler.py"
+            runtime = root / "Scripts" / "python" / "writer_autocomplete.py"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text("RUNTIME_SENTINEL = 42\n", encoding="utf-8")
+            module.__file__ = str(handler)
+            module._RUNTIME_MODULE = None
+
+            loaded = module._load_writer_runtime()
+
+            self.assertEqual(loaded.RUNTIME_SENTINEL, 42)
+            self.assertFalse((runtime.parent / "__pycache__").exists())
+
     def test_control_text_helpers(self):
         module = load_module()
 

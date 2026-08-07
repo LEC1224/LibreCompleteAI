@@ -1,7 +1,7 @@
 import json
-import importlib.util
 import math
 import os
+import types
 
 try:
     import uno
@@ -55,6 +55,7 @@ DISPATCH_PROTOCOL = "vnd.librecompleteai:"
 SUPPORTED_DISPATCH_COMMANDS = ("toggle", "continuous", "complete", "settings")
 SECONDARY_DISPATCH_COMMANDS = ("continuous", "complete", "settings")
 _RUNTIME_MODULE = None
+RUNTIME_VERSION = "0.2.11"
 DEFAULT_SETTINGS = {
     "provider": "openai",
     "openai_api_key": "",
@@ -511,9 +512,13 @@ def _load_writer_runtime():
         return _RUNTIME_MODULE
 
     script_path = os.path.join(os.path.dirname(__file__), "Scripts", "python", "writer_autocomplete.py")
-    spec = importlib.util.spec_from_file_location("_librecompleteai_writer_runtime", script_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module_name = "_librecompleteai_writer_runtime_" + RUNTIME_VERSION.replace(".", "_")
+    module = types.ModuleType(module_name)
+    module.__file__ = script_path
+    module.__package__ = ""
+    with open(script_path, "r", encoding="utf-8-sig") as script_file:
+        source = script_file.read()
+    exec(compile(source, script_path, "exec"), module.__dict__)
     _RUNTIME_MODULE = module
     return module
 
