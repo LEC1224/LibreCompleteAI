@@ -95,7 +95,7 @@ For Codex use:
 3. Leave Codex executable as `codex` when it is on LibreOffice's `PATH`, or enter the full path to the Codex executable.
 4. Optionally set a Codex model. Leave it empty to use Codex's current default model.
 
-Each Codex request starts a non-interactive, ephemeral session that reuses the CLI's saved login. LibreCompleteAI disables Codex web search, ignores Codex user configuration and rules, uses a temporary empty working directory, requests a read-only sandbox, and instructs Codex not to call tools. The document context and generated result are still sent to OpenAI through Codex. The Codex provider does not use the Temperature or Token cap fields; Prediction words remains enforced by the prompt and LibreCompleteAI's local output filter.
+LibreCompleteAI starts one local Codex app-server in the background as soon as LC-AI is enabled and forks a clean ephemeral thread for each request, reusing the CLI's saved login without carrying prose from one completion into the next. Reference material is injected once during that background warm-up; LC-AI hashes the configured paths and contents before each request and rebuilds the base only when the hash changes. It also asks the Codex model catalog for the lowest reasoning effort the selected model actually supports. It uses a temporary empty working directory, requests a read-only sandbox, disables web search and agent tools, and falls back to the older one-shot `codex exec` integration when the installed CLI does not support app-server. The document context and generated result are still sent to OpenAI through Codex. The Codex provider does not use the Temperature or Token cap fields; Prediction words remains enforced by the prompt and LibreCompleteAI's local output filter.
 
 Generation controls:
 
@@ -109,7 +109,8 @@ Reference files:
 
 - Use `Add files...` to select one or several `.md` or `.txt` files. Add more files in another pass when they live in different folders.
 - The toolbar settings dialog lists the selected files and can remove individual entries. The normal LibreOffice Options page also accepts one path per line and provides `Add...` and `Clear` buttons.
-- LibreCompleteAI reads the files again for every suggestion, so saved changes to canon, character sheets, or world-building notes are used without reopening the settings dialog.
+- LibreCompleteAI checks reference-file timestamps for every suggestion and reuses cached content while a file is unchanged, so saved edits are picked up without repeatedly reading the same files.
+- With Codex app-server, unchanged reference material is not resent from the extension for each completion. Ephemeral completion threads inherit it from a hash-keyed base thread; adding, removing, renaming, or editing a reference rebuilds that base before the next request. The `codex exec` compatibility fallback remains one-shot and therefore includes references in each invocation.
 - Up to 20 files are retained. Their combined prompt content is capped at 48,000 characters and shared across the available files; oversized files are marked as truncated in the model context. Missing, unreadable, empty, and unsupported files are skipped without blocking autocomplete.
 
 Ollama completion modes:
@@ -122,7 +123,7 @@ Ollama models are kept loaded for 30 minutes after a request to avoid repeated c
 
 Autocomplete always treats the cursor as the temporary end of the document. Already-written text after the cursor is neither extracted nor sent to the model, so a mid-document request behaves like an end-of-document continuation. The writer can decide how and whether to connect the generated passage to the later text.
 
-API keys and reference-file paths are stored locally in plain text in the user's configuration directory. Reference-file contents are sent to the selected model provider as part of each autocomplete request; with Ollama they stay on the configured Ollama host.
+API keys and reference-file paths are stored locally in plain text in the user's configuration directory. Reference-file contents are included in the selected model provider's context; with Ollama they stay on the configured Ollama host. Codex app-server caches them locally in its base thread, but the model still processes that inherited reference context for each completion.
 
 If the API key field is left empty, LibreCompleteAI can still use an `OPENAI_API_KEY` environment variable at completion time. Environment keys are not displayed or saved by the settings UI.
 

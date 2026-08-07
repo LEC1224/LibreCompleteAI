@@ -257,6 +257,190 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIn("Mara never removes her silver gloves.", joined)
         self.assertNotIn(str(root), joined)
 
+    def test_codex_messages_leave_references_for_app_server_session_cache(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            reference = Path(directory) / "canon.md"
+            reference.write_text("The northern moon is called Ilyra.", encoding="utf-8")
+            settings = module.normalize_settings(
+                {"provider": "codex", "reference_files": str(reference)}
+            )
+            messages = module.build_messages("Mara looked up.", "", settings)
+            reference_context, reference_hash = module._reference_context_snapshot(settings)
+
+        joined = "\n".join(message["content"] for message in messages)
+        self.assertNotIn("The northern moon is called Ilyra.", joined)
+        self.assertIn("The northern moon is called Ilyra.", reference_context)
+        self.assertEqual(len(reference_hash), 64)
+
+    def test_codex_app_server_uses_lowest_effort_supported_by_each_model(self):
+        module = load_module()
+        client = object.__new__(module._CodexAppServerClient)
+        client.model_reasoning_efforts = {}
+        client._rpc = lambda *args, **kwargs: {
+            "data": [
+                {
+                    "id": "gpt-minimal",
+                    "model": "gpt-minimal",
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "minimal"},
+                        {"reasoningEffort": "high"},
+                    ],
+                },
+                {
+                    "id": "gpt-low-only",
+                    "model": "gpt-low-only",
+                    "isDefault": False,
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "low"},
+                        {"reasoningEffort": "medium"},
+                    ],
+                },
+            ]
+        }
+
+        client._load_model_reasoning_efforts()
+
+        self.assertEqual(client._reasoning_effort_for_model("gpt-minimal"), "minimal")
+        self.assertEqual(client._reasoning_effort_for_model("gpt-low-only"), "low")
+        self.assertEqual(client._reasoning_effort_for_model(""), "minimal")
+        self.assertEqual(client._reasoning_effort_for_model("unknown-model"), "low")
+
+    def test_codex_session_prewarm_prepares_reference_base(self):
+        module = load_module()
+        prepared = []
+
+        class Client:
+            def prepare(self, settings):
+                prepared.append(settings)
+
+        original_resolve = module._resolve_codex_executable
+        original_client = module._codex_app_server_client
+        module._resolve_codex_executable = lambda configured: "C:/Tools/codex.exe"
+        module._codex_app_server_client = lambda executable: Client()
+        try:
+            settings = module.normalize_settings({"provider": "codex"})
+            module._prewarm_codex_session(settings)
+        finally:
+            module._resolve_codex_executable = original_resolve
+            module._codex_app_server_client = original_client
+
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(prepared[0]["provider"], "codex")
+
+    def test_codex_reference_base_thread_rebuilds_only_when_content_hash_changes(self):
+        module = load_module()
+
+        class WorkingDirectory:
+            name = "C:/temporary-codex-session"
+
+        client = object.__new__(module._CodexAppServerClient)
+        client.reference_base_key = None
+        client.reference_base_thread_id = None
+        client.working_directory = WorkingDirectory()
+        calls = []
+        base_count = [0]
+
+        def fake_rpc(method, params, timeout, unavailable_on_error=False):
+            calls.append((method, params))
+            if method == "thread/start":
+                base_count[0] += 1
+                return {"thread": {"id": f"base-{base_count[0]}"}}
+            return {}
+
+        client._rpc = fake_rpc
+        with tempfile.TemporaryDirectory() as directory:
+            reference = Path(directory) / "canon.md"
+            reference.write_text("The moon is called Ilyra.", encoding="utf-8")
+            settings = module.normalize_settings(
+                {"provider": "codex", "reference_files": str(reference)}
+            )
+
+            first = client._ensure_reference_base_thread(settings)
+            calls_after_first = len(calls)
+            second = client._ensure_reference_base_thread(settings)
+            self.assertEqual(len(calls), calls_after_first)
+
+            original_stat = reference.stat()
+            reference.write_text("The moon is called Veyra.", encoding="utf-8")
+            os.utime(
+                reference,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            third = client._ensure_reference_base_thread(settings)
+
+        self.assertEqual((first, second, third), ("base-1", "base-1", "base-2"))
+        methods = [method for method, _params in calls]
+        self.assertEqual(
+            methods,
+            [
+                "thread/start",
+                "thread/inject_items",
+                "thread/start",
+                "thread/inject_items",
+                "thread/delete",
+            ],
+        )
+        first_injection = calls[1][1]["items"][0]["content"][0]["text"]
+        second_injection = calls[3][1]["items"][0]["content"][0]["text"]
+        self.assertIn("Ilyra", first_injection)
+        self.assertIn("Veyra", second_injection)
+
+    def test_codex_app_server_interrupts_active_turn_when_request_is_cancelled(self):
+        module = load_module()
+
+        class Process:
+            def poll(self):
+                return None
+
+        class WorkingDirectory:
+            name = "C:/temporary-codex-session"
+
+        client = object.__new__(module._CodexAppServerClient)
+        client.lock = threading.RLock()
+        client.process = Process()
+        client.working_directory = WorkingDirectory()
+        client._ensure_reference_base_thread = lambda settings: "base-thread"
+        client._unsubscribe_thread = lambda thread_id: None
+        calls = []
+
+        def fake_rpc(method, params, timeout, unavailable_on_error=False):
+            calls.append((method, params))
+            if method == "thread/fork":
+                return {"thread": {"id": "request-thread"}}
+            if method == "turn/start":
+                return {"turn": {"id": "request-turn"}}
+            return {}
+
+        cancel_event = threading.Event()
+
+        def fake_next_message(deadline, poll_interval=None):
+            cancel_event.set()
+            return None
+
+        client._rpc = fake_rpc
+        client._next_message = fake_next_message
+        module._REQUEST_CONTEXT.cancel_event = cancel_event
+        try:
+            with self.assertRaises(module._RequestCancelled):
+                client.complete(
+                    [{"role": "user", "content": "Continue."}],
+                    module.normalize_settings({"provider": "codex"}),
+                )
+        finally:
+            del module._REQUEST_CONTEXT.cancel_event
+
+        self.assertIn(
+            (
+                "turn/interrupt",
+                {"threadId": "request-thread", "turnId": "request-turn"},
+            ),
+            calls,
+        )
+        turn_start = next(params for method, params in calls if method == "turn/start")
+        self.assertEqual(turn_start["effort"], "low")
+
     def test_reference_context_skips_missing_and_unsupported_files(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -1049,7 +1233,10 @@ class WriterAutocompleteTests(unittest.TestCase):
 
         messages = []
         original_message_box = module._message_box
+        original_prewarm = module._schedule_codex_session_prewarm
         module._message_box = lambda *args: messages.append(args)
+        prewarmed = []
+        module._schedule_codex_session_prewarm = lambda settings: prewarmed.append(settings)
         try:
             doc = Doc()
             self.assertFalse(module.is_autocomplete_enabled(doc))
@@ -1060,8 +1247,10 @@ class WriterAutocompleteTests(unittest.TestCase):
             self.assertTrue(module.disable_autocomplete_for_doc(doc))
             self.assertFalse(module.is_autocomplete_enabled(doc))
             self.assertEqual(messages, [])
+            self.assertEqual(len(prewarmed), 1)
         finally:
             module._message_box = original_message_box
+            module._schedule_codex_session_prewarm = original_prewarm
 
     def test_document_key_prefers_runtime_uid_over_proxy_identity(self):
         module = load_module()
@@ -1094,10 +1283,15 @@ class WriterAutocompleteTests(unittest.TestCase):
         second_proxy = Doc(controller)
         self.assertNotEqual(id(first_proxy), id(second_proxy))
 
-        self.assertTrue(module.enable_autocomplete_for_doc(first_proxy))
-        self.assertTrue(module.is_autocomplete_enabled(second_proxy))
-        self.assertTrue(module.disable_autocomplete_for_doc(second_proxy))
-        self.assertFalse(module.is_autocomplete_enabled(first_proxy))
+        original_prewarm = module._schedule_codex_session_prewarm
+        module._schedule_codex_session_prewarm = lambda settings: None
+        try:
+            self.assertTrue(module.enable_autocomplete_for_doc(first_proxy))
+            self.assertTrue(module.is_autocomplete_enabled(second_proxy))
+            self.assertTrue(module.disable_autocomplete_for_doc(second_proxy))
+            self.assertFalse(module.is_autocomplete_enabled(first_proxy))
+        finally:
+            module._schedule_codex_session_prewarm = original_prewarm
 
     def test_toggle_continuous_suggestions_for_doc_updates_settings(self):
         module = load_module()
