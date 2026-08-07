@@ -21,6 +21,7 @@ It is intended for LibreOffice 7.0 or newer.
 - The main LC-AI enabled state is remembered and restored automatically for each Writer window on the next startup.
 - A fallback "Complete Now" command if you want to test completion without enabling the Tab hook.
 - A ghost-text style preview: press Tab once to preview, press Tab again to accept.
+- A visible, formatting-safe three-dot cursor pulse while a manual completion or revision request is running; press Escape to cancel it.
 - Selected-text grammar, spelling, and wording revisions with optional square-bracketed editing guidance.
 - Optional continuous suggestions after natural writing pauses.
 - Context compression for long documents, using the same selected LLM.
@@ -133,7 +134,7 @@ In Writer, use the `LC-AI` button on the LibreCompleteAI toolbar, or choose:
 Tools > Add-ons > Toggle LibreCompleteAI
 ```
 
-The `LC-AI` button stays pressed while LibreCompleteAI is enabled for the current Writer window. The secondary toolbar buttons are available only while LC-AI is enabled. Press Tab while the cursor is in document text to send text before the cursor to the selected model, ask for a natural continuation, and show the result as pale temporary text at the cursor.
+The `LC-AI` button stays pressed while LibreCompleteAI is enabled for the current Writer window. The secondary toolbar buttons are available only while LC-AI is enabled. Press Tab while the cursor is in document text to send text before the cursor to the selected model. A fixed three-dot marker pulses between fully opaque and translucent at the request position without changing font color, replacing existing characters, or moving the cursor; its original character properties are restored before it is removed. It disappears when the result returns or fails. Press Escape while it is visible to cancel the active request immediately. Successful results appear as pale temporary text at the cursor; failures and cancellations end silently.
 
 To revise a word or phrase, select it and press Tab. LC-AI sends the selection and up to ten surrounding words on each side to the selected model, then previews a replacement in pale text directly after the selection. It corrects grammar and spelling while preserving the wording when it is already correct. Add square-bracketed guidance inside the selection when you want a substantive change, for example `He walked into the forest unworried [Use a more fitting verb and adjective]`. The bracketed guidance is sent to the model but is removed from the accepted replacement.
 
@@ -164,4 +165,4 @@ The compact text toolbar is docked near the top of Writer. If it does not refres
 
 LibreOffice Writer does not expose a native Cursor-style ghost text overlay through the simple macro API used here. This extension works around that by inserting tracked, temporary, pale text and deleting or committing it on the next key action.
 
-Because the preview is temporarily real document text, dismiss or accept it before saving. Toggling LibreCompleteAI off also removes any active preview. Manual Tab completions run synchronously, so Writer may pause briefly while the model responds; continuous suggestions run in the background.
+Because the preview is temporarily real document text, dismiss or accept it before saving. Toggling LibreCompleteAI off also removes any active preview. Manual Tab completions and continuous suggestions both run in the background. You can keep typing or use Writer while a request is in flight; LC-AI shows only the untyped remainder when your new text matches the suggestion and discards a stale result after unrelated edits or cursor movement.

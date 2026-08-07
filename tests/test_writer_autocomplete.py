@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -474,7 +475,7 @@ class WriterAutocompleteTests(unittest.TestCase):
         finally:
             module._REGENERATION_STATES.pop(key, None)
 
-    def test_empty_manual_completion_reports_no_useful_continuation(self):
+    def test_empty_manual_completion_silently_removes_request_indicator(self):
         module = load_module()
 
         class Doc:
@@ -490,6 +491,15 @@ class WriterAutocompleteTests(unittest.TestCase):
 
         doc = Doc()
         messages = []
+        indicators = []
+
+        class Indicator:
+            def __init__(self):
+                self.removed = False
+
+            def remove(self):
+                self.removed = True
+
         originals = {
             "_is_writer_document": module._is_writer_document,
             "_has_ghost": module._has_ghost,
@@ -498,6 +508,8 @@ class WriterAutocompleteTests(unittest.TestCase):
             "_get_text_context": module._get_text_context,
             "request_completion": module.request_completion,
             "_message_box": module._message_box,
+            "_start_daemon_thread": module._start_daemon_thread,
+            "_show_request_indicator": module._show_request_indicator,
         }
         module._is_writer_document = lambda current_doc: True
         module._has_ghost = lambda current_doc: False
@@ -510,6 +522,8 @@ class WriterAutocompleteTests(unittest.TestCase):
         )
         module.request_completion = lambda *args, **kwargs: ""
         module._message_box = lambda *args: messages.append(args)
+        module._start_daemon_thread = lambda target, args: target(*args)
+        module._show_request_indicator = lambda *args, **kwargs: indicators.append(Indicator()) or indicators[-1]
         try:
             module.complete_current_position(doc, preview=True, quiet=False)
         finally:
@@ -517,8 +531,230 @@ class WriterAutocompleteTests(unittest.TestCase):
                 setattr(module, name, value)
             module._BUSY_DOCS.discard("quiet-seam-document")
 
-        self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0][-1], "The model did not return a useful continuation.")
+        self.assertEqual(messages, [])
+        self.assertEqual(len(indicators), 1)
+        self.assertTrue(indicators[0].removed)
+
+    def test_manual_completion_schedules_provider_work_without_blocking_key_handler(self):
+        module = load_module()
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "async-manual-document"
+
+        class Status:
+            def __init__(self):
+                self.started = False
+                self.ended = False
+
+            def start(self, *args):
+                self.started = True
+
+            def end(self):
+                self.ended = True
+
+        doc = Doc()
+        status = Status()
+        scheduled = []
+        indicators = []
+
+        class Indicator:
+            def __init__(self):
+                self.removed = False
+
+            def remove(self):
+                self.removed = True
+
+        originals = {
+            "_is_writer_document": module._is_writer_document,
+            "_has_ghost": module._has_ghost,
+            "_has_selected_text": module._has_selected_text,
+            "load_settings": module.load_settings,
+            "_status_indicator": module._status_indicator,
+            "_get_text_context": module._get_text_context,
+            "_start_daemon_thread": module._start_daemon_thread,
+            "_show_request_indicator": module._show_request_indicator,
+        }
+        module._is_writer_document = lambda current_doc: True
+        module._has_ghost = lambda current_doc: False
+        module._has_selected_text = lambda current_doc: False
+        module.load_settings = lambda: module.normalize_settings({})
+        module._status_indicator = lambda current_doc: status
+        module._get_text_context = lambda current_doc, settings: (object(), "before", "")
+        module._start_daemon_thread = lambda target, args: scheduled.append((target, args))
+        module._show_request_indicator = lambda *args, **kwargs: indicators.append(Indicator()) or indicators[-1]
+        try:
+            module.complete_current_position(doc, preview=True)
+            self.assertEqual(len(scheduled), 1)
+            self.assertTrue(status.started)
+            self.assertFalse(status.ended)
+            self.assertIn("async-manual-document", module._BUSY_DOCS)
+            self.assertEqual(len(indicators), 1)
+            self.assertFalse(indicators[0].removed)
+        finally:
+            module._finish_manual_request("async-manual-document")
+            for name, value in originals.items():
+                setattr(module, name, value)
+
+        self.assertTrue(status.ended)
+        self.assertTrue(indicators[0].removed)
+
+    def test_manual_completion_keeps_matching_text_typed_while_model_runs(self):
+        module = load_module()
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "typing-during-request"
+
+        class Status:
+            def end(self):
+                pass
+
+        doc = Doc()
+        shown = []
+        originals = {
+            "_get_text_context": module._get_text_context,
+            "_show_ghost_completion": module._show_ghost_completion,
+        }
+        settings = module.normalize_settings({})
+        request_id = module._begin_manual_request(
+            doc,
+            "typing-during-request",
+            Status(),
+            {
+                "kind": "completion",
+                "prefix": "The story",
+                "settings": settings,
+                "regeneration": None,
+                "preview": True,
+                "quiet": False,
+            },
+        )
+        module._get_text_context = lambda current_doc, current_settings: (
+            object(),
+            "The story continued",
+            "",
+        )
+        module._show_ghost_completion = lambda *args, **kwargs: shown.append((args, kwargs))
+        try:
+            module._handle_manual_completion_response(
+                doc,
+                "typing-during-request",
+                request_id,
+                "The story",
+                " continued into the night",
+                None,
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(module, name, value)
+            module._finish_manual_request("typing-during-request")
+
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(shown[0][0][2], " into the night")
+
+    def test_request_indicator_loops_without_replacing_text_and_restores_formatting(self):
+        module = load_module()
+
+        class Range:
+            def __init__(self):
+                self.text = module.REQUEST_INDICATOR_TEXT
+                self.CharColor = 0x123456
+                self.CharTransparence = module.REQUEST_INDICATOR_TRANSPARENCIES[0]
+                self.replacements = []
+                self.transparency_when_removed = None
+
+            def getString(self):
+                return self.text
+
+            def setString(self, value):
+                self.replacements.append(value)
+                if value == "":
+                    self.transparency_when_removed = self.CharTransparence
+                self.text = value
+
+            def getStart(self):
+                return self
+
+        text_range = Range()
+        indicator = module.RequestIndicator(
+            object(),
+            text_range,
+            {"CharColor": 0x123456, "CharTransparence": 0},
+        )
+        indicator._schedule_next_frame = lambda: None
+        transparencies = []
+        for _index in range(5):
+            indicator._advance_frame()
+            transparencies.append(text_range.CharTransparence)
+
+        self.assertEqual(
+            transparencies,
+            [55, 0, 55, 0, 55],
+        )
+        self.assertEqual(text_range.getString(), module.REQUEST_INDICATOR_TEXT)
+        self.assertEqual(text_range.replacements, [])
+        self.assertEqual(text_range.CharColor, 0x123456)
+
+        indicator.remove()
+        self.assertEqual(text_range.getString(), "")
+        self.assertEqual(text_range.replacements, [""])
+        self.assertEqual(text_range.transparency_when_removed, 0)
+        self.assertEqual(text_range.CharTransparence, 0)
+        self.assertFalse(indicator.active)
+
+    def test_escape_cancels_active_manual_request_and_removes_indicator(self):
+        module = load_module()
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "escape-cancel-document"
+
+        class Status:
+            def __init__(self):
+                self.ended = False
+
+            def end(self):
+                self.ended = True
+
+        class Indicator:
+            def __init__(self):
+                self.removed = False
+
+            def remove(self):
+                self.removed = True
+
+        class Event:
+            KeyCode = module.ESCAPE
+            Modifiers = 0
+            KeyChar = ""
+
+        doc = Doc()
+        status = Status()
+        indicator = Indicator()
+        cancel_event = threading.Event()
+        key = module._doc_key(doc)
+        module._begin_manual_request(
+            doc,
+            key,
+            status,
+            {
+                "kind": "completion",
+                "indicator": indicator,
+                "cancel_event": cancel_event,
+            },
+        )
+        try:
+            handler = module.LibreCompleteAIKeyHandler(doc)
+            self.assertTrue(handler.keyPressed(Event()))
+        finally:
+            module._finish_manual_request(key)
+
+        self.assertTrue(cancel_event.is_set())
+        self.assertTrue(indicator.removed)
+        self.assertTrue(status.ended)
+        self.assertNotIn(key, module._MANUAL_REQUESTS)
+        self.assertNotIn(key, module._BUSY_DOCS)
 
     def test_discard_ghost_restores_insertion_properties(self):
         module = load_module()
@@ -763,6 +999,19 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(state, "mismatch")
         self.assertEqual(remaining, "")
 
+    def test_reconcile_completion_handles_a_full_rolling_context_window(self):
+        module = load_module()
+        request_prefix = "0123456789" * 30
+        typed = " and then"
+        current_prefix = request_prefix[len(typed) :] + typed
+        state, remaining = module._reconcile_continuous_completion(
+            request_prefix,
+            current_prefix,
+            " and then the door opened",
+        )
+        self.assertEqual(state, "match")
+        self.assertEqual(remaining, " the door opened")
+
     def test_continuous_word_threshold_uses_words_since_last_request(self):
         module = load_module()
         key = "doc-test"
@@ -909,6 +1158,54 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(payload["max_completion_tokens"], 32)
         self.assertEqual(payload["reasoning_effort"], "minimal")
         self.assertNotIn("max_tokens", payload)
+
+    def test_http_request_closes_active_response_when_cancelled(self):
+        module = load_module()
+        reading = threading.Event()
+        closed = threading.Event()
+        cancel_event = threading.Event()
+        errors = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.close()
+
+            def read(self):
+                reading.set()
+                closed.wait(2)
+                raise OSError("response closed")
+
+            def close(self):
+                closed.set()
+
+        original_urlopen = module.urllib.request.urlopen
+        module.urllib.request.urlopen = lambda request, timeout: Response()
+
+        def make_request():
+            module._REQUEST_CONTEXT.cancel_event = cancel_event
+            try:
+                module._post_json("http://localhost/test", {"prompt": "continue"})
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                del module._REQUEST_CONTEXT.cancel_event
+
+        worker = threading.Thread(target=make_request)
+        try:
+            worker.start()
+            self.assertTrue(reading.wait(1))
+            cancel_event.set()
+            worker.join(2)
+        finally:
+            module.urllib.request.urlopen = original_urlopen
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(closed.is_set())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], module._RequestCancelled)
 
     def test_request_codex_uses_saved_login_and_constrained_exec(self):
         module = load_module()

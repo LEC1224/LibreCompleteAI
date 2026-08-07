@@ -15,7 +15,7 @@ import urllib.request
 try:
     import uno
     import unohelper
-    from com.sun.star.awt import XActionListener, XAdjustmentListener, XKeyHandler
+    from com.sun.star.awt import XActionListener, XAdjustmentListener, XCallback, XKeyHandler
     from com.sun.star.awt.FontSlant import ITALIC
     from com.sun.star.awt.Key import ESCAPE, RIGHT, TAB
     from com.sun.star.awt.KeyModifier import MOD1
@@ -41,6 +41,9 @@ except Exception:
     class XAdjustmentListener(object):
         pass
 
+    class XCallback(object):
+        pass
+
     ESCAPE = 1281
     RIGHT = 1027
     TAB = 1282
@@ -53,6 +56,9 @@ EXTENSION_NAME = "LibreCompleteAI"
 EXTENSION_IDENTIFIER = "org.codex.librecompleteai"
 GHOST_COLOR = 0x9AA0A6
 GHOST_PROPERTIES = ("CharColor", "CharPosture", "CharTransparence")
+REQUEST_INDICATOR_TEXT = "\u2009\u25cf\u25cf\u25cf"
+REQUEST_INDICATOR_INTERVAL_SECONDS = 0.22
+REQUEST_INDICATOR_TRANSPARENCIES = (0, 55, 0, 55)
 NO_SPACE_BEFORE_COMPLETION_START = ".,;:!?)]}%"
 NO_SPACE_AFTER_PREFIX_END = "([{/"
 DEFAULT_SETTINGS = {
@@ -117,6 +123,10 @@ exactly unchanged. Do not explain your choices or mention the task, selection, i
 
 _HANDLERS = {}
 _BUSY_DOCS = set()
+_MANUAL_REQUESTS = {}
+_MANUAL_LOCK = threading.RLock()
+_MANUAL_SEQUENCE = 0
+_REQUEST_CONTEXT = threading.local()
 _GHOSTS = {}
 _CONTEXT_SUMMARIES = {}
 _REGENERATION_STATES = {}
@@ -132,6 +142,8 @@ _CONTINUOUS_LOCK = threading.RLock()
 _CONTINUOUS_SEQUENCE = 0
 _CONTINUOUS_TIMER_SEQUENCE = 0
 _DIALOG_LISTENERS = {}
+_PENDING_UI_CALLBACKS = set()
+_UI_CALLBACK_LOCK = threading.RLock()
 CONTINUOUS_MIN_INTERVAL_SECONDS = 0.75
 CONTINUOUS_IDLE_DELAY_SECONDS = 0.85
 CONTINUOUS_TRIGGER_WORDS = 3
@@ -726,7 +738,26 @@ def _safe_prefix_echo_overlap(prefix_tail, completion, size):
     return True
 
 
+class _RequestCancelled(RuntimeError):
+    pass
+
+
+def _current_request_cancel_event():
+    return getattr(_REQUEST_CONTEXT, "cancel_event", None)
+
+
+def _request_is_cancelled():
+    cancel_event = _current_request_cancel_event()
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _raise_if_request_cancelled():
+    if _request_is_cancelled():
+        raise _RequestCancelled("The completion request was cancelled.")
+
+
 def request_completion(prefix, suffix, settings, cache_key=None, regeneration=None):
+    _raise_if_request_cancelled()
     settings = normalize_settings(settings)
     prefix = _compress_context_if_needed(prefix, settings, cache_key)
     # Deliberately discard any supplied suffix. Autocomplete is a forward
@@ -735,6 +766,7 @@ def request_completion(prefix, suffix, settings, cache_key=None, regeneration=No
 
 
 def request_revision(selected, before, after, settings, regeneration=None):
+    _raise_if_request_cancelled()
     settings = normalize_settings(settings)
     token_limit = _revision_token_limit(settings)
     if settings["provider"] == "ollama":
@@ -1511,16 +1543,45 @@ def _is_unsupported_parameter(error, parameter):
 
 
 def _post_json(url, payload, headers=None, timeout=90):
+    _raise_if_request_cancelled()
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers or {}, method="POST")
+    cancel_event = _current_request_cancel_event()
+    cancel_watch_done = threading.Event()
+    response_holder = {"response": None}
+
+    def close_response_when_cancelled():
+        while not cancel_watch_done.wait(0.1):
+            if cancel_event.is_set():
+                response = response_holder.get("response")
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return
+
+    if cancel_event is not None:
+        threading.Thread(target=close_response_when_cancelled, daemon=True).start()
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_holder["response"] = response
+            _raise_if_request_cancelled()
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
+        _raise_if_request_cancelled()
         body = exc.read().decode("utf-8", "replace")
         raise _HttpJsonError(exc.code, url, body)
     except urllib.error.URLError as exc:
+        _raise_if_request_cancelled()
         raise RuntimeError(f"Could not reach {url}: {exc.reason}")
+    except (OSError, ValueError):
+        _raise_if_request_cancelled()
+        raise
+    finally:
+        cancel_watch_done.set()
+
+    _raise_if_request_cancelled()
 
     try:
         return json.loads(body)
@@ -1542,6 +1603,46 @@ def _component_context():
     if uno:
         return uno.getComponentContext()
     return None
+
+
+class _UiCallback(unohelper.Base, XCallback):
+    def __init__(self, callback):
+        self.callback = callback
+
+    def notify(self, _data):
+        try:
+            self.callback()
+        finally:
+            with _UI_CALLBACK_LOCK:
+                _PENDING_UI_CALLBACKS.discard(self)
+
+
+def _post_to_ui(callback):
+    """Marshal UNO/document work onto LibreOffice's event queue."""
+    if uno is None:
+        callback()
+        return
+    try:
+        ctx = _component_context()
+        service_manager = ctx.getServiceManager()
+        dispatcher = service_manager.createInstanceWithContext(
+            "com.sun.star.awt.AsyncCallback",
+            ctx,
+        )
+        listener = _UiCallback(callback)
+        with _UI_CALLBACK_LOCK:
+            _PENDING_UI_CALLBACKS.add(listener)
+        dispatcher.addCallback(listener, None)
+    except Exception:
+        try:
+            with _UI_CALLBACK_LOCK:
+                _PENDING_UI_CALLBACKS.discard(listener)
+        except Exception:
+            pass
+        # Older/minimal LibreOffice builds may not expose AsyncCallback. The
+        # background request still must complete, so retain the previous direct
+        # callback behavior as a compatibility fallback.
+        callback()
 
 
 def _controller(doc):
@@ -1666,6 +1767,80 @@ def _has_selected_text(doc):
         return not _cursor_is_collapsed(_view_cursor(doc))
     except Exception:
         return False
+
+
+class RequestIndicator:
+    def __init__(self, doc, text_range, original_properties=None):
+        self.doc = doc
+        self.text_range = text_range
+        self.original_properties = dict(original_properties or {})
+        self.phase = 0
+        self.timer = None
+        self.active = True
+        self.lock = threading.RLock()
+
+    def start(self):
+        self._schedule_next_frame()
+
+    def matches_document(self):
+        try:
+            return self.text_range.getString() == REQUEST_INDICATOR_TEXT
+        except Exception:
+            return False
+
+    def remove(self):
+        with self.lock:
+            self.active = False
+            timer = self.timer
+            self.timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        if self.matches_document():
+            try:
+                insertion_point = self.text_range.getStart()
+            except Exception:
+                insertion_point = None
+            try:
+                _apply_properties(self.text_range, self.original_properties)
+                self.text_range.setString("")
+            except Exception:
+                pass
+            if insertion_point is not None:
+                _apply_properties(insertion_point, self.original_properties)
+
+    def _schedule_next_frame(self):
+        with self.lock:
+            if not self.active:
+                return
+            timer = threading.Timer(REQUEST_INDICATOR_INTERVAL_SECONDS, self._timer_fired)
+            timer.daemon = True
+            self.timer = timer
+        timer.start()
+
+    def _timer_fired(self):
+        _post_to_ui(self._advance_frame)
+
+    def _advance_frame(self):
+        with self.lock:
+            if not self.active:
+                return
+            if not self.matches_document():
+                self.active = False
+                self.timer = None
+                return
+            self.phase = (self.phase + 1) % len(REQUEST_INDICATOR_TRANSPARENCIES)
+            transparency = REQUEST_INDICATOR_TRANSPARENCIES[self.phase]
+        try:
+            self.text_range.CharTransparence = transparency
+        except Exception:
+            with self.lock:
+                self.active = False
+                self.timer = None
+            return
+        self._schedule_next_frame()
 
 
 class GhostCompletion:
@@ -1932,6 +2107,37 @@ def _clear_regeneration_states(key):
     _REVISION_REGENERATION_STATES.pop(key, None)
 
 
+def _show_request_indicator(doc, view_cursor, preserve_selection=False):
+    text = view_cursor.getText()
+    selected_text = view_cursor.getString() if preserve_selection else ""
+    selected_start = view_cursor.getStart() if preserve_selection else None
+    insertion_cursor = text.createTextCursorByRange(view_cursor.getEnd())
+    original_properties = _capture_properties(insertion_cursor, GHOST_PROPERTIES)
+    text.insertString(insertion_cursor, REQUEST_INDICATOR_TEXT, True)
+
+    indicator_range = text.createTextCursorByRange(insertion_cursor.getEnd())
+    if not _go_left(indicator_range, len(REQUEST_INDICATOR_TEXT), True):
+        raise RuntimeError("The request indicator could not be placed in the document.")
+    try:
+        indicator_range.CharTransparence = REQUEST_INDICATOR_TRANSPARENCIES[0]
+    except Exception:
+        pass
+    if preserve_selection:
+        selected_range = text.createTextCursorByRange(selected_start)
+        if not _go_right(selected_range, len(selected_text), True):
+            indicator_range.setString("")
+            raise RuntimeError("The selected text changed before the request could start.")
+        _select_view_range(doc, selected_range)
+    else:
+        indicator_start = indicator_range.getStart()
+        _move_view_cursor_to_range(doc, indicator_start)
+        _restore_insertion_properties(doc, indicator_start, original_properties)
+
+    indicator = RequestIndicator(doc, indicator_range, original_properties)
+    indicator.start()
+    return indicator
+
+
 def _show_ghost_completion(
     doc,
     view_cursor,
@@ -2100,37 +2306,43 @@ def revise_current_selection(doc=None, preview=True, quiet=False):
         return
 
     settings = load_settings()
-    _BUSY_DOCS.add(key)
     status = _status_indicator(doc)
+    indicator = None
+    cancel_event = threading.Event()
     try:
         status.start("Revising selected text...", 0)
-        view_cursor, selected, before, after = _get_revision_context(doc)
+        view_cursor_at_request, selected, before, after = _get_revision_context(doc)
         request_context = _revision_request_context(selected, before, after)
         regeneration = _revision_regeneration_for_context(key, request_context)
-        revision = request_revision(selected, before, after, settings, regeneration=regeneration)
-        if revision:
-            if preview:
-                _show_ghost_revision(
-                    doc,
-                    view_cursor,
-                    selected,
-                    revision,
-                    request_context,
-                    regeneration_attempt=(regeneration or {}).get("attempt", 0),
-                )
-            else:
-                view_cursor.setString(revision)
-        elif not quiet:
-            _message_box(doc, EXTENSION_NAME, "The model did not return a useful revision.")
+        indicator = _show_request_indicator(doc, view_cursor_at_request, preserve_selection=True)
+        request_id = _begin_manual_request(
+            doc,
+            key,
+            status,
+            {
+                "kind": "revision",
+                "selected": selected,
+                "before": before,
+                "after": after,
+                "request_context": request_context,
+                "settings": dict(settings),
+                "regeneration": regeneration,
+                "preview": bool(preview),
+                "quiet": bool(quiet),
+                "indicator": indicator,
+                "cancel_event": cancel_event,
+            },
+        )
+        _start_daemon_thread(
+            _manual_revision_worker,
+            (doc, key, request_id, selected, before, after, dict(settings), regeneration, cancel_event),
+        )
     except Exception as exc:
+        state = _finish_manual_request(key, status=status)
+        if not state and indicator is not None:
+            indicator.remove()
         if not quiet:
             _message_box(doc, EXTENSION_NAME, str(exc))
-    finally:
-        try:
-            status.end()
-        except Exception:
-            pass
-        _BUSY_DOCS.discard(key)
 
 
 def complete_current_position(doc=None, preview=True, quiet=False):
@@ -2153,37 +2365,228 @@ def complete_current_position(doc=None, preview=True, quiet=False):
         return
 
     settings = load_settings()
-    _BUSY_DOCS.add(key)
     status = _status_indicator(doc)
+    indicator = None
+    cancel_event = threading.Event()
     try:
         status.start("Generating writing autocomplete...", 0)
-        view_cursor, prefix, suffix = _get_text_context(doc, settings)
+        view_cursor_at_request, prefix, suffix = _get_text_context(doc, settings)
         regeneration = _regeneration_for_context(key, prefix, suffix)
-        completion = request_completion(prefix, suffix, settings, key, regeneration=regeneration)
-        completion = _completion_with_context_spacing(prefix, completion)
-        if completion:
-            if preview:
-                _show_ghost_completion(
-                    doc,
-                    view_cursor,
-                    completion,
-                    request_prefix=prefix,
-                    regeneration_attempt=(regeneration or {}).get("attempt", 0),
-                )
-            else:
-                _insert_completion(view_cursor, completion)
-        else:
-            if not quiet:
-                _message_box(doc, EXTENSION_NAME, "The model did not return a useful continuation.")
+        indicator = _show_request_indicator(doc, view_cursor_at_request)
+        request_id = _begin_manual_request(
+            doc,
+            key,
+            status,
+            {
+                "kind": "completion",
+                "prefix": prefix,
+                "suffix": suffix,
+                "settings": dict(settings),
+                "regeneration": regeneration,
+                "preview": bool(preview),
+                "quiet": bool(quiet),
+                "indicator": indicator,
+                "cancel_event": cancel_event,
+            },
+        )
+        _start_daemon_thread(
+            _manual_completion_worker,
+            (doc, key, request_id, prefix, suffix, dict(settings), regeneration, cancel_event),
+        )
     except Exception as exc:
+        state = _finish_manual_request(key, status=status)
+        if not state and indicator is not None:
+            indicator.remove()
         if not quiet:
             _message_box(doc, EXTENSION_NAME, str(exc))
-    finally:
+
+
+def _next_manual_request_id():
+    global _MANUAL_SEQUENCE
+    with _MANUAL_LOCK:
+        _MANUAL_SEQUENCE += 1
+        return _MANUAL_SEQUENCE
+
+
+def _begin_manual_request(doc, key, status, state):
+    request_id = _next_manual_request_id()
+    with _MANUAL_LOCK:
+        if key in _MANUAL_REQUESTS or key in _BUSY_DOCS:
+            raise RuntimeError("A completion request is already running for this document.")
+        state = dict(state)
+        state.update({"id": request_id, "doc": doc, "status": status})
+        _MANUAL_REQUESTS[key] = state
+        _BUSY_DOCS.add(key)
+    return request_id
+
+
+def _finish_manual_request(key, request_id=None, status=None):
+    with _MANUAL_LOCK:
+        current = _MANUAL_REQUESTS.get(key)
+        if request_id is not None and (not current or current.get("id") != request_id):
+            return None
+        if current:
+            _MANUAL_REQUESTS.pop(key, None)
+            status = current.get("status") or status
+        _BUSY_DOCS.discard(key)
+    if current:
+        indicator = current.get("indicator")
+        if indicator is not None:
+            indicator.remove()
+    if status is not None:
         try:
             status.end()
         except Exception:
             pass
-        _BUSY_DOCS.discard(key)
+    return current
+
+
+def _cancel_manual_request(doc):
+    key = _doc_key(doc)
+    with _MANUAL_LOCK:
+        current = _MANUAL_REQUESTS.get(key)
+        if not current:
+            return False
+        request_id = current.get("id")
+        cancel_event = current.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+    _finish_manual_request(key, request_id=request_id)
+    return True
+
+
+def _start_daemon_thread(target, args):
+    worker = threading.Thread(target=target, args=args, daemon=True)
+    worker.start()
+    return worker
+
+
+def _schedule_codex_session_prewarm(settings):
+    if str(settings.get("provider") or "").strip().lower() == "codex":
+        return _start_daemon_thread(_prewarm_codex_session, (dict(settings),))
+    return None
+
+
+def _manual_completion_worker(doc, key, request_id, prefix, suffix, settings, regeneration, cancel_event=None):
+    completion = ""
+    error = None
+    _REQUEST_CONTEXT.cancel_event = cancel_event
+    try:
+        completion = request_completion(prefix, suffix, settings, key, regeneration=regeneration)
+    except Exception as exc:
+        error = exc
+    finally:
+        try:
+            del _REQUEST_CONTEXT.cancel_event
+        except Exception:
+            pass
+    _post_to_ui(
+        lambda: _handle_manual_completion_response(
+            doc,
+            key,
+            request_id,
+            prefix,
+            completion,
+            error,
+        )
+    )
+
+
+def _manual_revision_worker(
+    doc,
+    key,
+    request_id,
+    selected,
+    before,
+    after,
+    settings,
+    regeneration,
+    cancel_event=None,
+):
+    revision = ""
+    error = None
+    _REQUEST_CONTEXT.cancel_event = cancel_event
+    try:
+        revision = request_revision(selected, before, after, settings, regeneration=regeneration)
+    except Exception as exc:
+        error = exc
+    finally:
+        try:
+            del _REQUEST_CONTEXT.cancel_event
+        except Exception:
+            pass
+    _post_to_ui(
+        lambda: _handle_manual_revision_response(
+            doc,
+            key,
+            request_id,
+            revision,
+            error,
+        )
+    )
+
+
+def _handle_manual_completion_response(doc, key, request_id, request_prefix, completion, error):
+    state = _finish_manual_request(key, request_id=request_id)
+    if not state:
+        return
+    if error is not None:
+        return
+    if not completion:
+        return
+
+    try:
+        view_cursor, current_prefix, _suffix = _get_text_context(doc, state["settings"])
+    except Exception:
+        return
+    match, remaining = _reconcile_completion_with_current_text(
+        request_prefix,
+        current_prefix,
+        completion,
+    )
+    if not match or not remaining:
+        return
+    remaining = _completion_with_context_spacing(current_prefix, remaining)
+    if not remaining.strip():
+        return
+    if state["preview"]:
+        _show_ghost_completion(
+            doc,
+            view_cursor,
+            remaining,
+            request_prefix=current_prefix,
+            regeneration_attempt=(state.get("regeneration") or {}).get("attempt", 0),
+        )
+    else:
+        _insert_completion(view_cursor, remaining)
+
+
+def _handle_manual_revision_response(doc, key, request_id, revision, error):
+    state = _finish_manual_request(key, request_id=request_id)
+    if not state:
+        return
+    if error is not None:
+        return
+    if not revision:
+        return
+
+    try:
+        view_cursor, selected, before, after = _get_revision_context(doc)
+    except Exception:
+        return
+    if _revision_request_context(selected, before, after) != state["request_context"]:
+        return
+    if state["preview"]:
+        _show_ghost_revision(
+            doc,
+            view_cursor,
+            selected,
+            revision,
+            state["request_context"],
+            regeneration_attempt=(state.get("regeneration") or {}).get("attempt", 0),
+        )
+    else:
+        view_cursor.setString(revision)
 
 
 def _maybe_start_continuous_request(doc, event):
@@ -2226,6 +2629,10 @@ def _continuous_idle_timer_fired(doc, key, timer_id):
             return
         _CONTINUOUS_TIMERS.pop(key, None)
 
+    _post_to_ui(lambda: _start_continuous_request_if_enabled(doc))
+
+
+def _start_continuous_request_if_enabled(doc):
     try:
         settings = load_settings()
         if _bool_setting(settings, "continuous_suggestions"):
@@ -2283,12 +2690,10 @@ def _start_continuous_request(doc, settings, force=False):
         _LAST_AUTO_REQUEST[key] = now
         _LAST_AUTO_PREFIX[key] = prefix
 
-    worker = threading.Thread(
-        target=_continuous_request_worker,
-        args=(doc, key, request_id, prefix, suffix, dict(settings)),
-        daemon=True,
+    _start_daemon_thread(
+        _continuous_request_worker,
+        (doc, key, request_id, prefix, suffix, dict(settings)),
     )
-    worker.start()
     return True
 
 
@@ -2304,7 +2709,16 @@ def _continuous_request_worker(doc, key, request_id, request_prefix, request_suf
         completion = request_completion(request_prefix, request_suffix, settings, key)
     except Exception:
         completion = ""
-    _handle_continuous_response(doc, key, request_id, request_prefix, completion, settings)
+    _post_to_ui(
+        lambda: _handle_continuous_response(
+            doc,
+            key,
+            request_id,
+            request_prefix,
+            completion,
+            settings,
+        )
+    )
 
 
 def _handle_continuous_response(doc, key, request_id, request_prefix, completion, settings):
@@ -2340,14 +2754,38 @@ def _handle_continuous_response(doc, key, request_id, request_prefix, completion
 
 
 def _reconcile_continuous_completion(request_prefix, current_prefix, completion):
-    if not current_prefix.startswith(request_prefix):
+    typed_tail = _typed_tail_after_request(request_prefix, current_prefix)
+    if typed_tail is None:
         return "mismatch", ""
-
-    typed_tail = current_prefix[len(request_prefix) :]
     remaining = _completion_remainder_after_typed(completion, typed_tail)
     if remaining is None:
         return "mismatch", ""
     return "match", remaining
+
+
+def _reconcile_completion_with_current_text(request_prefix, current_prefix, completion):
+    state, remaining = _reconcile_continuous_completion(request_prefix, current_prefix, completion)
+    return state == "match", remaining
+
+
+def _typed_tail_after_request(request_prefix, current_prefix):
+    if current_prefix.startswith(request_prefix):
+        return current_prefix[len(request_prefix) :]
+
+    # Context extraction uses a rolling character window. Once it is full,
+    # ordinary typing trims characters from the left, so compare the surviving
+    # overlap instead of treating that harmless slide as a cursor move.
+    if not request_prefix or not current_prefix:
+        return None
+    minimum_overlap = min(len(request_prefix), max(64, len(request_prefix) // 2))
+    first_chunk = current_prefix[: min(64, len(current_prefix))]
+    search_at = request_prefix.find(first_chunk)
+    while search_at >= 0:
+        overlap = len(request_prefix) - search_at
+        if overlap >= minimum_overlap and current_prefix.startswith(request_prefix[search_at:]):
+            return current_prefix[overlap:]
+        search_at = request_prefix.find(first_chunk, search_at + 1)
+    return None
 
 
 def _completion_remainder_after_typed(completion, typed_tail):
@@ -2416,6 +2854,9 @@ class LibreCompleteAIKeyHandler(unohelper.Base, XKeyHandler):
         try:
             key_code = getattr(event, "KeyCode", None)
             modifiers = getattr(event, "Modifiers", 0)
+
+            if key_code == ESCAPE and modifiers == 0 and _cancel_manual_request(self.doc):
+                return True
 
             if _has_ghost(self.doc):
                 if key_code == TAB and modifiers == 0:
@@ -2548,6 +2989,7 @@ def disable_autocomplete_for_doc(doc, notify=False):
         _discard_ghost(doc)
         _clear_regeneration_states(key)
         _clear_continuous_state(key)
+        _finish_manual_request(key)
         controller.removeKeyHandler(handler)
     finally:
         pass
