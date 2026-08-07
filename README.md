@@ -50,7 +50,7 @@ In LibreOffice:
 Tools > Extension Manager > Add...
 ```
 
-Choose `dist/LibreCompleteAI.oxt`, install it for the current user, and restart LibreOffice.
+Choose `dist/LibreCompleteAI.oxt`, install it for the current user, then close every LibreOffice window and reopen Writer. LibreOffice keeps extension Python code loaded for the lifetime of the process, so closing only the Extension Manager is not enough after an update.
 
 LibreCompleteAI's Add-ons menu commands are packaged for current-user installation. If an older test build is already installed, remove it from Extension Manager first, restart LibreOffice, then install the new `.oxt`.
 
