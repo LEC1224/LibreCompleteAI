@@ -153,6 +153,8 @@ _UI_CALLBACK_LOCK = threading.RLock()
 _CODEX_APP_SERVER_CLIENTS = {}
 _CODEX_APP_SERVER_DISABLED = set()
 _CODEX_APP_SERVER_LOCK = threading.RLock()
+_OPENAI_PARAMETER_SUPPORT = {}
+_OPENAI_PARAMETER_LOCK = threading.RLock()
 CONTINUOUS_MIN_INTERVAL_SECONDS = 0.75
 CONTINUOUS_IDLE_DELAY_SECONDS = 0.85
 CONTINUOUS_TRIGGER_WORDS = 3
@@ -170,7 +172,7 @@ OLLAMA_COMPLETION_MODES = ("auto", "guided", "raw")
 SUPPORTED_PROVIDERS = ("openai", "ollama", "codex")
 OLLAMA_KEEP_ALIVE = "30m"
 OLLAMA_STRUCTURED_TOKEN_OVERHEAD = 12
-OLLAMA_GUIDED_FAILURE_THRESHOLD = 2
+OLLAMA_GUIDED_FAILURE_THRESHOLD = 1
 OLLAMA_MIN_CONTEXT_TOKENS = 2048
 OLLAMA_MAX_CONTEXT_TOKENS = 16384
 OLLAMA_CONTEXT_RESERVE_TOKENS = 512
@@ -831,7 +833,15 @@ def _raise_if_request_cancelled():
 def request_completion(prefix, suffix, settings, cache_key=None, regeneration=None):
     _raise_if_request_cancelled()
     settings = normalize_settings(settings)
-    prefix = _compress_context_if_needed(prefix, settings, cache_key)
+    # Autocomplete is latency-sensitive. Never put a second provider request
+    # (context summarization) in front of the actual completion. A bounded local
+    # excerpt keeps both the request count and prompt prefill time predictable.
+    prefix = _compress_context_if_needed(
+        prefix,
+        settings,
+        cache_key,
+        allow_external_summary=False,
+    )
     # Deliberately discard any supplied suffix. Autocomplete is a forward
     # continuation from the cursor, even when the user is editing mid-file.
     return _generate_completion_once(prefix, "", settings, regeneration)
@@ -2044,6 +2054,14 @@ def _is_qwen3_model(model):
 
 def _post_openai_chat_completion(url, payload, headers):
     payload = dict(payload)
+    capability_key = (str(url).rstrip("/").lower(), str(payload.get("model", "")).lower())
+    with _OPENAI_PARAMETER_LOCK:
+        support = dict(_OPENAI_PARAMETER_SUPPORT.get(capability_key, {}))
+    if support.get("reasoning_effort") is False:
+        payload.pop("reasoning_effort", None)
+    if support.get("max_completion_tokens") is False and "max_completion_tokens" in payload:
+        payload["max_tokens"] = payload.pop("max_completion_tokens")
+
     removed_reasoning = False
     swapped_token_limit = False
     while True:
@@ -2058,6 +2076,7 @@ def _post_openai_chat_completion(url, payload, headers):
                 payload = dict(payload)
                 payload.pop("reasoning_effort", None)
                 removed_reasoning = True
+                _cache_openai_parameter_support(capability_key, "reasoning_effort", False)
                 continue
             if (
                 not swapped_token_limit
@@ -2067,14 +2086,24 @@ def _post_openai_chat_completion(url, payload, headers):
                 payload = dict(payload)
                 payload["max_tokens"] = payload.pop("max_completion_tokens")
                 swapped_token_limit = True
+                _cache_openai_parameter_support(capability_key, "max_completion_tokens", False)
                 continue
             raise
 
 
-def _compress_context_if_needed(prefix, settings, cache_key=None):
+def _cache_openai_parameter_support(cache_key, parameter, supported):
+    with _OPENAI_PARAMETER_LOCK:
+        current = _OPENAI_PARAMETER_SUPPORT.setdefault(cache_key, {})
+        current[parameter] = bool(supported)
+
+
+def _compress_context_if_needed(prefix, settings, cache_key=None, allow_external_summary=True):
     max_words = _int_setting(settings, "max_context_words")
     if max_words <= 0 or _word_count(prefix) <= max_words:
         return prefix
+
+    if not allow_external_summary:
+        return _local_context_excerpt(prefix, max_words)
 
     recent_words = max(SUMMARY_RECENT_MIN_WORDS, int(max_words * SUMMARY_RECENT_RATIO))
     older, recent = _split_recent_words(prefix, recent_words)
@@ -2092,6 +2121,28 @@ def _compress_context_if_needed(prefix, settings, cache_key=None):
     return (
         "[Compressed earlier context]\n"
         f"{summary.strip()}\n\n"
+        "[Recent text before cursor]\n"
+        f"{recent.strip()}"
+    )
+
+
+def _local_context_excerpt(prefix, max_words):
+    """Keep useful long-document context without another network/model call."""
+    max_words = max(1, int(max_words))
+    if _word_count(prefix) <= max_words:
+        return prefix
+
+    # Preserve a small opening excerpt for titles, premises, and named entities,
+    # while devoting most of the budget to the text immediately before the cursor.
+    opening_words = max(20, min(max_words // 5, 120)) if max_words >= 40 else 0
+    recent_words = max_words - opening_words
+    recent = _last_words(prefix, recent_words)
+    if not opening_words:
+        return recent
+    opening = _first_words(prefix, opening_words)
+    return (
+        "[Opening excerpt]\n"
+        f"{opening.strip()}\n\n"
         "[Recent text before cursor]\n"
         f"{recent.strip()}"
     )

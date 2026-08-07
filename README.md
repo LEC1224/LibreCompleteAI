@@ -24,7 +24,7 @@ It is intended for LibreOffice 7.0 or newer.
 - A visible, formatting-safe three-dot cursor pulse while a manual completion or revision request is running; press Escape to cancel it.
 - Selected-text grammar, spelling, and wording revisions with optional square-bracketed editing guidance.
 - Optional continuous suggestions after natural writing pauses.
-- Context compression for long documents, using the same selected LLM.
+- Single-request long-document context excerpts that preserve the opening and the text nearest the cursor.
 - Tunable context length and prediction length controls.
 - A reasoning toggle, off by default, so autocomplete favors direct text generation.
 
@@ -101,7 +101,7 @@ Generation controls:
 
 - `Continuous autocomplete suggestions`: request suggestions in the background after you type a few new words. If you keep typing while the model thinks, LibreCompleteAI only shows the remaining ghost text when your typed words match the returned suggestion; otherwise it discards the stale suggestion and asks again from the new cursor context.
 - `Allow reasoning`: off by default. When off, LibreCompleteAI asks supported providers to avoid reasoning (`think: false` for most Ollama models, Qwen3 `/no_think` where applicable, GPT-OSS `low`, and the lowest reasoning effort supported by OpenAI-compatible chat completions) and strips visible thinking or meta-commentary if a model returns it anyway.
-- `Context words`: how many words before the cursor should guide suggestions. Older text is compressed with the selected LLM when the context grows beyond this budget.
+- `Context words`: how many words before the cursor should guide suggestions. When the document exceeds this budget, LC-AI keeps a small opening excerpt plus the most recent text locally, avoiding a second model call before autocomplete.
 - `Prediction words`: the target suggestion length and hard maximum, wherever the cursor is in the document.
 - `Token cap`: the semantic output budget. Guided Ollama requests add a small internal allowance for their JSON envelope; extracted document text is still capped at the configured prediction-word count.
 
@@ -115,11 +115,11 @@ Reference files:
 
 Ollama completion modes:
 
-- `auto`: sends an OpenAI-like guided chat request with before-cursor context, writing guidance, retry directions, disabled thinking, and a JSON schema containing only the completion. The extracted text still passes through the meta-response, prefix-echo, and length filters. If a model rejects structured output or returns invalid/meta text, LC-AI retries through raw continuation. After two guided failures from the same host/model, raw mode is cached for later requests during that LibreOffice session.
+- `auto`: sends an OpenAI-like guided chat request with before-cursor context, writing guidance, retry directions, disabled thinking, and a JSON schema containing only the completion. The extracted text still passes through the meta-response, prefix-echo, and length filters. If a model rejects structured output or returns invalid/meta text, LC-AI retries through raw continuation and immediately caches the faster raw path for later requests from that host/model during the LibreOffice session.
 - `guided`: always uses schema-constrained chat and reports a failure instead of silently switching modes. This is useful for testing whether a model follows the stronger contract.
 - `raw`: always uses the original plain `/api/generate` continuation behavior. It is the compatibility option for models that produce better prose from an unadorned prefix.
 
-Ollama models are kept loaded for 30 minutes after a request to avoid repeated cold-start delays during an active writing session. LC-AI also sizes Ollama's runtime context window from the actual prompt (between 2K and 16K tokens) instead of blindly allocating a model's advertised 128K/256K maximum; this helps small models remain fully GPU-resident. Long-context summaries continue to use Ollama chat.
+Ollama models are kept loaded for 30 minutes after a request to avoid repeated cold-start delays during an active writing session. LC-AI also sizes Ollama's runtime context window from the actual prompt (between 2K and 16K tokens) instead of blindly allocating a model's advertised 128K/256K maximum; this helps small models remain fully GPU-resident.
 
 Autocomplete always treats the cursor as the temporary end of the document. Already-written text after the cursor is neither extracted nor sent to the model, so a mid-document request behaves like an end-of-document continuation. The writer can decide how and whether to connect the generated passage to the later text.
 

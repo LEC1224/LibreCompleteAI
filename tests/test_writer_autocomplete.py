@@ -503,6 +503,33 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertIn("word149", compressed)
         self.assertTrue(calls)
 
+    def test_interactive_completion_uses_one_provider_call_for_long_context(self):
+        module = load_module()
+        captured = []
+        originals = {
+            "_generate_completion_once": module._generate_completion_once,
+            "_summarize_context": module._summarize_context,
+        }
+        module._generate_completion_once = lambda prefix, suffix, settings, regeneration=None: (
+            captured.append(prefix) or "a continuation"
+        )
+        module._summarize_context = lambda *args, **kwargs: self.fail(
+            "interactive completion should not make a summary request"
+        )
+        try:
+            prefix = " ".join(f"word{i}" for i in range(150))
+            settings = module.normalize_settings({"max_context_words": "40"})
+            completion = module.request_completion(prefix, "", settings, cache_key="fast-doc")
+        finally:
+            for name, value in originals.items():
+                setattr(module, name, value)
+
+        self.assertEqual(completion, "a continuation")
+        self.assertEqual(len(captured), 1)
+        self.assertIn("[Opening excerpt]", captured[0])
+        self.assertIn("[Recent text before cursor]", captured[0])
+        self.assertIn("word149", captured[0])
+
     def test_text_context_counts_backward_from_cursor_not_document_end(self):
         module = load_module()
 
@@ -1527,6 +1554,39 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(calls[0]["reasoning_effort"], "minimal")
         self.assertNotIn("reasoning_effort", calls[1])
 
+    def test_openai_compatibility_fallback_is_cached_for_later_requests(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(dict(payload))
+            if len(calls) == 1:
+                raise module._HttpJsonError(
+                    400,
+                    url,
+                    '{"error":{"code":"unsupported_parameter","param":"reasoning_effort"}}',
+                )
+            return {"choices": [{"message": {"content": "fallback line"}}]}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {
+                    "openai_api_key": "sk-test",
+                    "openai_model": "compatible-model",
+                }
+            )
+            self.assertEqual(module._request_openai("before", "", settings), "fallback line")
+            self.assertEqual(module._request_openai("before again", "", settings), "fallback line")
+        finally:
+            module._post_json = original
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn("reasoning_effort", calls[0])
+        self.assertNotIn("reasoning_effort", calls[1])
+        self.assertNotIn("reasoning_effort", calls[2])
+
     def test_request_openai_falls_back_to_max_tokens_for_compatible_servers(self):
         module = load_module()
         calls = []
@@ -1753,7 +1813,7 @@ class WriterAutocompleteTests(unittest.TestCase):
             ["http://localhost:11434/api/chat", "http://localhost:11434/api/generate"],
         )
 
-    def test_ollama_auto_caches_raw_after_repeated_guided_failures(self):
+    def test_ollama_auto_caches_raw_after_first_guided_failure(self):
         module = load_module()
         calls = []
 
@@ -1784,7 +1844,6 @@ class WriterAutocompleteTests(unittest.TestCase):
             [
                 "http://localhost:11434/api/chat",
                 "http://localhost:11434/api/generate",
-                "http://localhost:11434/api/chat",
                 "http://localhost:11434/api/generate",
                 "http://localhost:11434/api/generate",
             ],
