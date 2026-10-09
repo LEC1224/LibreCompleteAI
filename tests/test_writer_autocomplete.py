@@ -510,7 +510,7 @@ class WriterAutocompleteTests(unittest.TestCase):
             "_generate_completion_once": module._generate_completion_once,
             "_summarize_context": module._summarize_context,
         }
-        module._generate_completion_once = lambda prefix, suffix, settings, regeneration=None: (
+        module._generate_completion_once = lambda prefix, suffix, settings, regeneration=None, on_retry=None: (
             captured.append(prefix) or "a continuation"
         )
         module._summarize_context = lambda *args, **kwargs: self.fail(
@@ -809,6 +809,430 @@ class WriterAutocompleteTests(unittest.TestCase):
 
         self.assertTrue(status.ended)
         self.assertTrue(indicators[0].removed)
+
+    def _patch(self, module, **replacements):
+        originals = {name: getattr(module, name) for name in replacements}
+        for name, value in replacements.items():
+            setattr(module, name, value)
+
+        def restore():
+            for name, value in originals.items():
+                setattr(module, name, value)
+
+        self.addCleanup(restore)
+
+    def _patch_retry_hint_ui(self, module):
+        """Run UI marshalling and the hint's minimum-visibility delay inline.
+
+        A real (but detached) pyuno module can be importable outside
+        LibreOffice, in which case _post_to_ui queues onto an AsyncCallback
+        that nothing ever pumps. Forcing it synchronous keeps these tests about
+        the wiring itself; the delay has dedicated tests further down.
+        Returns the list of status indicators the hint creates.
+        """
+        statuses = []
+
+        class Status:
+            def __init__(self):
+                self.texts = []
+                self.ended = False
+
+            def start(self, text, value):
+                self.texts.append(text)
+
+            def end(self):
+                self.ended = True
+
+        def status_factory(current_doc):
+            statuses.append(Status())
+            return statuses[-1]
+
+        self._patch(
+            module,
+            _post_to_ui=lambda callback: callback(),
+            _schedule_delayed=lambda seconds, callback: callback(),
+            _status_indicator=status_factory,
+        )
+        return statuses
+
+    def _start_manual_request(self, module, doc_key, revise=False):
+        """Start a manual request through complete_current_position.
+
+        The worker is captured instead of started, so the test can run it
+        (and act in the middle of it) synchronously. statuses[0] is the
+        normal "Generating..."/"Revising..." indicator; the retry hint, if
+        any, is the next one.
+        """
+        statuses = self._patch_retry_hint_ui(module)
+        scheduled = []
+
+        class Doc:
+            def getRuntimeUID(self):
+                return doc_key
+
+        class Indicator:
+            def remove(self):
+                pass
+
+        self._patch(
+            module,
+            _is_writer_document=lambda current_doc: True,
+            _has_ghost=lambda current_doc: False,
+            _has_selected_text=lambda current_doc: revise,
+            load_settings=lambda: module.normalize_settings({}),
+            _get_text_context=lambda current_doc, settings: (object(), "before", ""),
+            _get_revision_context=lambda current_doc: (object(), "teh cat", "", ""),
+            _start_daemon_thread=lambda target, args: scheduled.append((target, args)),
+            _show_request_indicator=lambda *args, **kwargs: Indicator(),
+        )
+        self.addCleanup(module._BUSY_DOCS.discard, doc_key)
+        doc = Doc()
+        module.complete_current_position(doc, preview=True)
+        self.assertEqual(len(scheduled), 1)
+        target, args = scheduled[0]
+        return doc, statuses, lambda: target(*args)
+
+    def test_manual_completion_keeps_retry_hint_after_generating_status_ends(self):
+        module = load_module()
+        doc, statuses, run_worker = self._start_manual_request(module, "manual-retry-document")
+        delayed = []
+        self._patch(module, _schedule_delayed=lambda seconds, callback: delayed.append(callback))
+
+        def fake_request_completion(prefix, suffix, settings, cache_key=None, regeneration=None, on_retry=None):
+            on_retry()  # the OpenAI-compatible provider retried once
+            return ""
+
+        self._patch(module, request_completion=fake_request_completion)
+        run_worker()
+
+        generating, hint = statuses
+        self.assertTrue(generating.ended)
+        self.assertEqual(hint.texts, [module.REASONING_RETRY_STATUS_TEXT])
+        self.assertFalse(hint.ended)  # held for the minimum visible time
+        self.assertEqual(len(delayed), 1)
+        delayed[0]()
+        self.assertTrue(hint.ended)
+
+    def test_manual_completion_without_retry_shows_no_hint(self):
+        module = load_module()
+        doc, statuses, run_worker = self._start_manual_request(module, "manual-no-retry-document")
+        self._patch(module, request_completion=lambda *args, **kwargs: "")
+
+        run_worker()
+
+        self.assertEqual(len(statuses), 1)  # only "Generating..."
+        self.assertTrue(statuses[0].ended)
+
+    def test_manual_completion_hides_retry_hint_when_the_retry_fails(self):
+        module = load_module()
+        doc, statuses, run_worker = self._start_manual_request(module, "manual-retry-error-document")
+
+        def failing_request_completion(*args, on_retry=None, **kwargs):
+            on_retry()
+            raise RuntimeError("Could not reach the server")
+
+        self._patch(module, request_completion=failing_request_completion)
+        run_worker()
+
+        self.assertEqual(len(statuses), 2)
+        self.assertTrue(all(status.ended for status in statuses))
+
+    def test_cancelling_a_manual_request_hides_retry_hint_without_waiting_for_the_worker(self):
+        module = load_module()
+        doc, statuses, run_worker = self._start_manual_request(module, "manual-retry-cancel-document")
+        ended_while_worker_blocked = []
+
+        def fake_request_completion(*args, on_retry=None, **kwargs):
+            on_retry()
+            module._cancel_manual_request(doc)  # Esc while the retry is still running
+            ended_while_worker_blocked.extend(status.ended for status in statuses)
+            return ""
+
+        self._patch(module, request_completion=fake_request_completion)
+        run_worker()
+
+        self.assertEqual(ended_while_worker_blocked, [True, True])
+
+    def test_manual_revision_shows_retry_hint_until_the_request_is_done(self):
+        module = load_module()
+        doc, statuses, run_worker = self._start_manual_request(module, "revision-retry-document", revise=True)
+
+        def fake_request_revision(selected, before, after, settings, regeneration=None, on_retry=None):
+            on_retry()
+            return ""
+
+        self._patch(module, request_revision=fake_request_revision)
+        run_worker()
+
+        self.assertEqual(len(statuses), 2)
+        self.assertEqual(statuses[1].texts, [module.REASONING_RETRY_STATUS_TEXT])
+        self.assertTrue(all(status.ended for status in statuses))
+
+    def _run_continuous_request(self, module, doc, key, fake_request_completion, status_factory):
+        """Shared plumbing for the two continuous-indicator tests below."""
+        settings = module.normalize_settings({})
+        originals = {
+            "_has_ghost": module._has_ghost,
+            "_status_indicator": module._status_indicator,
+            "_get_text_context": module._get_text_context,
+            "_has_enough_new_words_for_continuous": module._has_enough_new_words_for_continuous,
+            "_start_daemon_thread": module._start_daemon_thread,
+            "request_completion": module.request_completion,
+            # A real (but detached) pyuno module can be importable even
+            # outside LibreOffice, in which case _post_to_ui queues onto an
+            # AsyncCallback that nothing ever pumps. Forcing it synchronous
+            # isolates the indicator wiring from that unrelated environment
+            # quirk.
+            "_post_to_ui": module._post_to_ui,
+            # _ReasoningRetryIndicator.hide() defers status.end() by up to
+            # REASONING_RETRY_MIN_VISIBLE_SECONDS via _schedule_delayed; run
+            # it inline here so these wiring-focused tests don't depend on
+            # timing (the delay itself is covered separately below).
+            "_schedule_delayed": module._schedule_delayed,
+        }
+        scheduled = []
+        module._has_ghost = lambda current_doc: False
+        module._status_indicator = status_factory
+        module._get_text_context = lambda current_doc, current_settings: (object(), "before", "")
+        module._has_enough_new_words_for_continuous = lambda k, prefix: True
+        module._start_daemon_thread = lambda target, args: scheduled.append((target, args))
+        module._post_to_ui = lambda callback: callback()
+        module._schedule_delayed = lambda seconds, callback: callback()
+        module.request_completion = fake_request_completion
+        try:
+            started = module._start_continuous_request(doc, settings, force=True)
+            self.assertTrue(started)
+            self.assertEqual(len(scheduled), 1)
+            target, args = scheduled[0]
+            target(*args)
+        finally:
+            for name, value in originals.items():
+                setattr(module, name, value)
+            module._CONTINUOUS_REQUESTS.pop(key, None)
+
+    def test_continuous_request_stays_silent_without_a_retry(self):
+        module = load_module()
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "continuous-silent-document"
+
+        created = []
+
+        class Status:
+            def __init__(self):
+                self.started = False
+                self.ended = False
+
+            def start(self, *args):
+                self.started = True
+
+            def end(self):
+                self.ended = True
+
+        def status_factory(current_doc):
+            created.append(Status())
+            return created[-1]
+
+        def fake_request_completion(prefix, suffix, current_settings, cache_key=None, on_retry=None):
+            return "a continuation"  # succeeds on the first try, no retry
+
+        self._run_continuous_request(
+            module, Doc(), "continuous-silent-document", fake_request_completion, status_factory
+        )
+
+        # _status_indicator should never even be called when nothing needs
+        # to retry: continuous suggestions stay completely silent.
+        self.assertEqual(created, [])
+
+    def test_continuous_request_shows_hint_only_when_retrying(self):
+        module = load_module()
+
+        class Doc:
+            def getRuntimeUID(self):
+                return "continuous-retry-document"
+
+        class Status:
+            def __init__(self):
+                self.started = False
+                self.ended = False
+                self.texts = []
+
+            def start(self, text, value):
+                self.started = True
+                self.texts.append(text)
+
+            def end(self):
+                self.ended = True
+
+        status = Status()
+
+        def fake_request_completion(prefix, suffix, current_settings, cache_key=None, on_retry=None):
+            on_retry()  # simulate the OpenAI-compatible provider retrying once
+            return "a continuation"
+
+        self._run_continuous_request(
+            module,
+            Doc(),
+            "continuous-retry-document",
+            fake_request_completion,
+            lambda current_doc: status,
+        )
+
+        self.assertTrue(status.started)
+        self.assertTrue(status.ended)
+        self.assertEqual(status.texts, [module.REASONING_RETRY_STATUS_TEXT])
+
+    def test_reasoning_retry_indicator_ends_immediately_once_shown_long_enough(self):
+        module = load_module()
+
+        class Status:
+            def __init__(self):
+                self.ended = False
+
+            def start(self, *args):
+                pass
+
+            def end(self):
+                self.ended = True
+
+        clock = [100.0, 100.0 + module.REASONING_RETRY_MIN_VISIBLE_SECONDS]
+        delayed_calls = []
+        originals = {
+            "_status_indicator": module._status_indicator,
+            "_monotonic": module._monotonic,
+            "_schedule_delayed": module._schedule_delayed,
+        }
+        status = Status()
+        module._status_indicator = lambda doc: status
+        module._monotonic = lambda: clock.pop(0)
+        module._schedule_delayed = lambda seconds, callback: delayed_calls.append((seconds, callback))
+        try:
+            indicator = module._ReasoningRetryIndicator(doc=object())
+            indicator.show()
+            indicator.hide()
+        finally:
+            for name, value in originals.items():
+                setattr(module, name, value)
+
+        # The hint was already visible for the full minimum by the time
+        # hide() ran, so status.end() fires right away with no timer.
+        self.assertEqual(delayed_calls, [])
+        self.assertTrue(status.ended)
+
+    def test_reasoning_retry_indicator_delays_hide_until_minimum_visible_time(self):
+        module = load_module()
+
+        class Status:
+            def __init__(self):
+                self.ended = False
+
+            def start(self, *args):
+                pass
+
+            def end(self):
+                self.ended = True
+
+        # Only 0.3s have passed when hide() is called, well under the minimum.
+        clock = [100.0, 100.3]
+        delayed_calls = []
+        originals = {
+            "_status_indicator": module._status_indicator,
+            "_monotonic": module._monotonic,
+            "_schedule_delayed": module._schedule_delayed,
+            "_post_to_ui": module._post_to_ui,
+        }
+        status = Status()
+        module._status_indicator = lambda doc: status
+        module._monotonic = lambda: clock.pop(0)
+        module._schedule_delayed = lambda seconds, callback: delayed_calls.append((seconds, callback))
+        module._post_to_ui = lambda callback: callback()
+        try:
+            indicator = module._ReasoningRetryIndicator(doc=object())
+            indicator.show()
+            indicator.hide()
+
+            # Not ended yet: hide() deferred the real end() call instead of
+            # letting the hint flash by after only 0.3s.
+            self.assertFalse(status.ended)
+            self.assertEqual(len(delayed_calls), 1)
+            seconds, callback = delayed_calls[0]
+            self.assertAlmostEqual(seconds, module.REASONING_RETRY_MIN_VISIBLE_SECONDS - 0.3, places=6)
+
+            # Once the deferred timer actually fires, the indicator ends.
+            callback()
+            self.assertTrue(status.ended)
+        finally:
+            for name, value in originals.items():
+                setattr(module, name, value)
+
+    def test_reasoning_retry_indicator_hide_without_show_is_a_no_op(self):
+        module = load_module()
+        delayed_calls = []
+        original = module._schedule_delayed
+        module._schedule_delayed = lambda seconds, callback: delayed_calls.append((seconds, callback))
+        try:
+            indicator = module._ReasoningRetryIndicator(doc=object())
+            indicator.hide()  # never shown - must not raise or schedule anything
+        finally:
+            module._schedule_delayed = original
+
+        self.assertEqual(delayed_calls, [])
+
+    def test_reasoning_retry_indicator_ignores_a_late_show_after_hide(self):
+        module = load_module()
+        statuses = self._patch_retry_hint_ui(module)
+        indicator = module._ReasoningRetryIndicator(doc=object())
+
+        indicator.hide()  # the request already finished...
+        indicator.show()  # ...before the queued show() got to run
+
+        self.assertEqual(statuses, [])
+
+    def test_reasoning_retry_indicator_is_not_stuck_when_hide_runs_inside_start(self):
+        module = load_module()
+        delayed = []
+        indicator = module._ReasoningRetryIndicator(doc=object())
+
+        class Status:
+            ended = False
+
+            def start(self, text, value):
+                # LibreOffice reschedules its event loop inside start(), which
+                # can run the already queued response handler right here.
+                indicator.hide()
+
+            def end(self):
+                self.ended = True
+
+        status = Status()
+        self._patch(
+            module,
+            _status_indicator=lambda doc: status,
+            _schedule_delayed=lambda seconds, callback: delayed.append(callback),
+            _post_to_ui=lambda callback: callback(),
+        )
+
+        indicator.show()
+
+        self.assertEqual(len(delayed), 1)
+        delayed[0]()
+        self.assertTrue(status.ended)
+
+    def test_reasoning_retry_indicator_hide_never_raises(self):
+        module = load_module()
+        statuses = self._patch_retry_hint_ui(module)
+
+        def broken_timer(seconds, callback):
+            raise RuntimeError("can't start new thread")
+
+        self._patch(module, _schedule_delayed=broken_timer)
+        indicator = module._ReasoningRetryIndicator(doc=object())
+        indicator.show()
+
+        indicator.hide()  # must not raise; ends the hint right away instead
+
+        self.assertTrue(statuses[0].ended)
 
     def test_manual_completion_keeps_matching_text_typed_while_model_runs(self):
         module = load_module()
@@ -1379,6 +1803,185 @@ class WriterAutocompleteTests(unittest.TestCase):
         self.assertEqual(payload["max_completion_tokens"], 32)
         self.assertEqual(payload["reasoning_effort"], "minimal")
         self.assertNotIn("max_tokens", payload)
+
+    def test_request_openai_retries_when_reasoning_exhausts_token_budget(self):
+        module = load_module()
+        payloads = []
+        responses = [
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "the next line"}, "finish_reason": "stop"}]},
+        ]
+
+        def fake_post_json(url, payload, headers):
+            payloads.append(dict(payload))
+            return responses[len(payloads) - 1]
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings(
+                {"openai_api_key": "sk-test", "openai_model": "gemma", "max_tokens": "48"}
+            )
+            self.assertEqual(module._request_openai("before", "after", settings), "the next line")
+        finally:
+            module._post_json = original
+
+        self.assertEqual(len(payloads), 2)
+        first_budget = payloads[0]["max_completion_tokens"]
+        self.assertLess(first_budget * 4, module.OPENAI_TRUNCATION_RETRY_MIN_TOKENS)
+        self.assertEqual(payloads[1]["max_completion_tokens"], module.OPENAI_TRUNCATION_RETRY_MIN_TOKENS)
+
+    def test_request_openai_retry_quadruples_a_larger_budget(self):
+        module = load_module()
+        payloads = []
+        responses = [
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "the next line"}, "finish_reason": "stop"}]},
+        ]
+
+        def fake_post_json(url, payload, headers):
+            payloads.append(dict(payload))
+            return responses[len(payloads) - 1]
+
+        self._patch(module, _post_json=fake_post_json)
+        settings = module.normalize_settings({"openai_api_key": "sk-test", "openai_model": "gemma"})
+
+        module._request_openai_messages(module.build_messages("before", "", settings), settings, token_limit=100)
+
+        self.assertEqual([payload["max_completion_tokens"] for payload in payloads], [100, 400])
+
+    def test_request_openai_does_not_retry_when_content_present(self):
+        module = load_module()
+        calls = []
+
+        def fake_post_json(url, payload, headers):
+            calls.append(payload)
+            return {"choices": [{"message": {"content": "ok"}, "finish_reason": "length"}]}
+
+        original = module._post_json
+        module._post_json = fake_post_json
+        try:
+            settings = module.normalize_settings({"openai_api_key": "sk-test", "openai_model": "m"})
+            self.assertEqual(module._request_openai("a", "b", settings), "ok")
+        finally:
+            module._post_json = original
+        self.assertEqual(len(calls), 1)
+
+    def test_request_openai_notifies_on_retry_only_when_retrying(self):
+        module = load_module()
+        retries = []
+        responses = [
+            {"choices": [{"message": {"content": "the next line"}, "finish_reason": "stop"}]},
+            {"choices": [{"message": {"content": None}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "the next line"}, "finish_reason": "stop"}]},
+        ]
+        self._patch(module, _post_json=lambda url, payload, headers: responses.pop(0))
+        settings = module.normalize_settings({"openai_api_key": "sk-test", "openai_model": "gemma"})
+        messages = module.build_messages("before", "", settings)
+
+        module._request_openai_messages(messages, settings, on_retry=lambda: retries.append("first"))
+        module._request_openai_messages(messages, settings, on_retry=lambda: retries.append("second"))
+
+        self.assertEqual(retries, ["second"])
+        self.assertEqual(responses, [])
+
+    def test_request_openai_retries_even_if_the_retry_hook_fails(self):
+        module = load_module()
+        responses = [
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "the next line"}, "finish_reason": "stop"}]},
+        ]
+        self._patch(module, _post_json=lambda url, payload, headers: responses.pop(0))
+        settings = module.normalize_settings({"openai_api_key": "sk-test", "openai_model": "gemma"})
+
+        def broken_hook():
+            raise RuntimeError("status bar unavailable")
+
+        content = module._request_openai_messages(
+            module.build_messages("before", "", settings), settings, on_retry=broken_hook
+        )
+
+        self.assertEqual(content, "the next line")
+
+    def test_request_openai_retries_without_hint_when_reasoning_is_allowed(self):
+        module = load_module()
+        retries = []
+        responses = [
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "the next line"}, "finish_reason": "stop"}]},
+        ]
+        self._patch(module, _post_json=lambda url, payload, headers: responses.pop(0))
+        settings = module.normalize_settings(
+            {"openai_api_key": "sk-test", "openai_model": "gemma", "allow_reasoning": "true"}
+        )
+
+        content = module._request_openai_messages(
+            module.build_messages("before", "", settings), settings, on_retry=lambda: retries.append(True)
+        )
+
+        self.assertEqual(content, "the next line")
+        self.assertEqual(responses, [])  # it still retried...
+        self.assertEqual(retries, [])  # ...but did not suggest turning thinking off
+
+    def test_request_openai_retries_when_inline_reasoning_is_cut_off(self):
+        module = load_module()
+        payloads = []
+        responses = [
+            {"choices": [{"message": {"content": "<think>The user wants me to continue"}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "the next line"}, "finish_reason": "stop"}]},
+        ]
+
+        def fake_post_json(url, payload, headers):
+            payloads.append(dict(payload))
+            return responses[len(payloads) - 1]
+
+        self._patch(module, _post_json=fake_post_json)
+        settings = module.normalize_settings({"openai_api_key": "sk-test", "openai_model": "qwen3"})
+
+        self.assertEqual(module._request_openai("before", "after", settings), "the next line")
+        self.assertEqual(len(payloads), 2)
+
+    def test_request_openai_does_not_retry_after_cancellation(self):
+        module = load_module()
+        cancel_event = threading.Event()
+        payloads = []
+        retries = []
+
+        def fake_post_json(url, payload, headers):
+            payloads.append(payload)
+            cancel_event.set()  # the user pressed Escape while the model was thinking
+            return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
+
+        self._patch(module, _post_json=fake_post_json)
+        settings = module.normalize_settings({"openai_api_key": "sk-test", "openai_model": "gemma"})
+        module._REQUEST_CONTEXT.cancel_event = cancel_event
+        try:
+            with self.assertRaises(module._RequestCancelled):
+                module._request_openai_messages(
+                    module.build_messages("before", "", settings),
+                    settings,
+                    on_retry=lambda: retries.append(True),
+                )
+        finally:
+            del module._REQUEST_CONTEXT.cancel_event
+
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(retries, [])
+
+    def test_request_revision_retries_and_notifies_when_reasoning_exhausts_budget(self):
+        module = load_module()
+        retries = []
+        responses = [
+            {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "the cat"}, "finish_reason": "stop"}]},
+        ]
+        self._patch(module, _post_json=lambda url, payload, headers: responses.pop(0))
+        settings = module.normalize_settings({"openai_api_key": "sk-test", "openai_model": "gemma"})
+
+        revision = module.request_revision("teh cat", "", "", settings, on_retry=lambda: retries.append(True))
+
+        self.assertEqual(revision, "the cat")
+        self.assertEqual(retries, [True])
 
     def test_http_request_closes_active_response_when_cancelled(self):
         module = load_module()
@@ -2035,6 +2638,31 @@ class WriterAutocompleteTests(unittest.TestCase):
         module = load_module()
         text = "<think>I should continue with a sentence.</think>\nCompletion: the candle bent toward the draft."
         self.assertEqual(module.clean_completion(text), "the candle bent toward the draft.")
+
+    def test_clean_completion_drops_reasoning_cut_off_by_token_budget(self):
+        module = load_module()
+        text = "<think>The user wants me to continue the sentence about"
+        self.assertEqual(module.clean_completion(text, "The house was"), "")
+
+    def test_clean_completion_keeps_literal_think_tags_in_prose(self):
+        module = load_module()
+        text = "wrap the reasoning in a <think> tag before answering."
+        self.assertEqual(module.clean_completion(text, "Tell the model to"), text)
+
+    def test_request_revision_keeps_literal_think_tags(self):
+        module = load_module()
+        revised = "Wrap the reasoning in a <think> tag before answering."
+        self._patch(
+            module,
+            _post_json=lambda url, payload, headers: {
+                "choices": [{"message": {"content": revised}, "finish_reason": "stop"}]
+            },
+        )
+        settings = module.normalize_settings({"openai_api_key": "sk-test", "openai_model": "gemma"})
+
+        revision = module.request_revision("Wrap teh reasoning in a <think> tag before answering.", "", "", settings)
+
+        self.assertEqual(revision, revised)
 
     def test_clean_completion_extracts_labeled_answer_after_meta_reasoning(self):
         module = load_module()

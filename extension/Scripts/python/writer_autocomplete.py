@@ -700,6 +700,9 @@ def _reasoning_instruction(settings):
 
 def _strip_reasoning_blocks(text):
     text = re.sub(r"(?is)<think>.*?</think>\s*", "", text)
+    # A reply that opens with a reasoning block cut off by the token budget
+    # never closes it: drop it. A literal "<think>" later in prose is kept.
+    text = re.sub(r"(?is)^\s*<think>.*\Z", "", text)
     text = re.sub(r"(?is)^\s*(analysis|reasoning|thoughts?)\s*:\s*.*?(?=\n\s*(final|completion|suggestion)\s*:|\Z)", "", text)
     return text
 
@@ -830,7 +833,7 @@ def _raise_if_request_cancelled():
         raise _RequestCancelled("The completion request was cancelled.")
 
 
-def request_completion(prefix, suffix, settings, cache_key=None, regeneration=None):
+def request_completion(prefix, suffix, settings, cache_key=None, regeneration=None, on_retry=None):
     _raise_if_request_cancelled()
     settings = normalize_settings(settings)
     # Autocomplete is latency-sensitive. Never put a second provider request
@@ -844,10 +847,10 @@ def request_completion(prefix, suffix, settings, cache_key=None, regeneration=No
     )
     # Deliberately discard any supplied suffix. Autocomplete is a forward
     # continuation from the cursor, even when the user is editing mid-file.
-    return _generate_completion_once(prefix, "", settings, regeneration)
+    return _generate_completion_once(prefix, "", settings, regeneration, on_retry=on_retry)
 
 
-def request_revision(selected, before, after, settings, regeneration=None):
+def request_revision(selected, before, after, settings, regeneration=None, on_retry=None):
     _raise_if_request_cancelled()
     settings = normalize_settings(settings)
     token_limit = _revision_token_limit(settings)
@@ -865,7 +868,7 @@ def request_revision(selected, before, after, settings, regeneration=None):
         raw = _request_codex_messages(messages, settings)
     else:
         messages = build_revision_messages(selected, before, after, settings, regeneration=regeneration)
-        raw = _request_openai_messages(messages, settings, token_limit)
+        raw = _request_openai_messages(messages, settings, token_limit, on_retry=on_retry)
     return _clean_revision(raw, selected)
 
 
@@ -895,7 +898,7 @@ def _revision_instruction_blocks(selected):
     return re.findall(r"\[[^\]]+\]", selected or "")
 
 
-def _generate_completion_once(prefix, suffix, settings, regeneration=None):
+def _generate_completion_once(prefix, suffix, settings, regeneration=None, on_retry=None):
     if settings["provider"] == "ollama":
         raw = _request_ollama_completion(
             prefix,
@@ -909,7 +912,9 @@ def _generate_completion_once(prefix, suffix, settings, regeneration=None):
         raw = _request_codex_messages(messages, settings)
     else:
         messages = build_messages(prefix, suffix, settings, regeneration=regeneration)
-        raw = _request_openai_messages(messages, settings, _completion_token_limit(settings))
+        raw = _request_openai_messages(
+            messages, settings, _completion_token_limit(settings), on_retry=on_retry
+        )
     return clean_completion(raw, prefix, max_words=_prediction_words(settings))
 
 
@@ -921,7 +926,7 @@ def _request_openai(prefix, suffix, settings):
     )
 
 
-def _request_openai_messages(messages, settings, token_limit=None, temperature=None):
+def _request_openai_messages(messages, settings, token_limit=None, temperature=None, on_retry=None):
     api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         raise RuntimeError("OpenAI provider is selected, but no API key is configured.")
@@ -945,10 +950,48 @@ def _request_openai_messages(messages, settings, token_limit=None, temperature=N
     }
     url = base_url + "/chat/completions"
     response = _post_openai_chat_completion(url, payload, headers)
+    if _openai_truncated_without_content(response):
+        # Reasoning models served by OpenAI-compatible servers (for example
+        # Gemma 4 in LM Studio) may ignore reasoning_effort and spend the whole
+        # small completion budget on reasoning, returning no usable text with
+        # finish_reason "length". Retry once with a larger budget instead of
+        # failing silently. The retry budget may exceed the Token cap on
+        # purpose: it is consumed by reasoning, and the visible text is still
+        # cut to Prediction words by clean_completion().
+        _raise_if_request_cancelled()
+        # The hint suggests turning thinking off, which would contradict an
+        # explicit "Allow reasoning" choice, so it is skipped in that case.
+        if on_retry is not None and not _bool_setting(settings, "allow_reasoning"):
+            try:
+                on_retry()
+            except Exception:
+                pass
+        payload = dict(payload)
+        first_budget = payload.get("max_completion_tokens") or payload.get("max_tokens") or 0
+        payload.pop("max_tokens", None)
+        payload["max_completion_tokens"] = max(OPENAI_TRUNCATION_RETRY_MIN_TOKENS, first_budget * 4)
+        response = _post_openai_chat_completion(url, payload, headers)
     try:
         return response["choices"][0]["message"]["content"]
     except Exception:
         raise RuntimeError("OpenAI response did not include a chat completion.")
+
+
+OPENAI_TRUNCATION_RETRY_MIN_TOKENS = 256
+
+
+def _openai_truncated_without_content(response):
+    try:
+        choice = response["choices"][0]
+        content = choice["message"].get("content") or ""
+    except Exception:
+        return False
+    if choice.get("finish_reason") != "length":
+        return False
+    # Hidden reasoning (reasoning_content) leaves content empty; servers that
+    # inline it instead return an unclosed <think> block, which counts as
+    # empty too.
+    return not _strip_reasoning_blocks(str(content)).strip()
 
 
 def _request_codex_messages(messages, settings):
@@ -3009,6 +3052,7 @@ def revise_current_selection(doc=None, preview=True, quiet=False):
         request_context = _revision_request_context(selected, before, after)
         regeneration = _revision_regeneration_for_context(key, request_context)
         indicator = _show_request_indicator(doc, view_cursor_at_request, preserve_selection=True)
+        retry_indicator = _ReasoningRetryIndicator(doc)
         request_id = _begin_manual_request(
             doc,
             key,
@@ -3024,12 +3068,24 @@ def revise_current_selection(doc=None, preview=True, quiet=False):
                 "preview": bool(preview),
                 "quiet": bool(quiet),
                 "indicator": indicator,
+                "retry_indicator": retry_indicator,
                 "cancel_event": cancel_event,
             },
         )
         _start_daemon_thread(
             _manual_revision_worker,
-            (doc, key, request_id, selected, before, after, dict(settings), regeneration, cancel_event),
+            (
+                doc,
+                key,
+                request_id,
+                selected,
+                before,
+                after,
+                dict(settings),
+                regeneration,
+                cancel_event,
+                retry_indicator,
+            ),
         )
     except Exception as exc:
         state = _finish_manual_request(key, status=status)
@@ -3067,6 +3123,7 @@ def complete_current_position(doc=None, preview=True, quiet=False):
         view_cursor_at_request, prefix, suffix = _get_text_context(doc, settings)
         regeneration = _regeneration_for_context(key, prefix, suffix)
         indicator = _show_request_indicator(doc, view_cursor_at_request)
+        retry_indicator = _ReasoningRetryIndicator(doc)
         request_id = _begin_manual_request(
             doc,
             key,
@@ -3080,12 +3137,13 @@ def complete_current_position(doc=None, preview=True, quiet=False):
                 "preview": bool(preview),
                 "quiet": bool(quiet),
                 "indicator": indicator,
+                "retry_indicator": retry_indicator,
                 "cancel_event": cancel_event,
             },
         )
         _start_daemon_thread(
             _manual_completion_worker,
-            (doc, key, request_id, prefix, suffix, dict(settings), regeneration, cancel_event),
+            (doc, key, request_id, prefix, suffix, dict(settings), regeneration, cancel_event, retry_indicator),
         )
     except Exception as exc:
         state = _finish_manual_request(key, status=status)
@@ -3127,6 +3185,9 @@ def _finish_manual_request(key, request_id=None, status=None):
         indicator = current.get("indicator")
         if indicator is not None:
             indicator.remove()
+        retry_indicator = current.get("retry_indicator")
+        if retry_indicator is not None:
+            retry_indicator.hide()
     if status is not None:
         try:
             status.end()
@@ -3161,12 +3222,21 @@ def _schedule_codex_session_prewarm(settings):
     return None
 
 
-def _manual_completion_worker(doc, key, request_id, prefix, suffix, settings, regeneration, cancel_event=None):
+def _manual_completion_worker(
+    doc, key, request_id, prefix, suffix, settings, regeneration, cancel_event=None, retry_indicator=None
+):
     completion = ""
     error = None
     _REQUEST_CONTEXT.cancel_event = cancel_event
     try:
-        completion = request_completion(prefix, suffix, settings, key, regeneration=regeneration)
+        completion = request_completion(
+            prefix,
+            suffix,
+            settings,
+            key,
+            regeneration=regeneration,
+            on_retry=retry_indicator.show_from_worker if retry_indicator is not None else None,
+        )
     except Exception as exc:
         error = exc
     finally:
@@ -3196,12 +3266,20 @@ def _manual_revision_worker(
     settings,
     regeneration,
     cancel_event=None,
+    retry_indicator=None,
 ):
     revision = ""
     error = None
     _REQUEST_CONTEXT.cancel_event = cancel_event
     try:
-        revision = request_revision(selected, before, after, settings, regeneration=regeneration)
+        revision = request_revision(
+            selected,
+            before,
+            after,
+            settings,
+            regeneration=regeneration,
+            on_retry=retry_indicator.show_from_worker if retry_indicator is not None else None,
+        )
     except Exception as exc:
         error = exc
     finally:
@@ -3399,8 +3477,17 @@ def _next_continuous_request_id():
 
 
 def _continuous_request_worker(doc, key, request_id, request_prefix, request_suffix, settings):
+    # Continuous suggestions stay silent: this indicator only appears if a
+    # reasoning model forces a retry (see _ReasoningRetryIndicator).
+    retry_indicator = _ReasoningRetryIndicator(doc)
     try:
-        completion = request_completion(request_prefix, request_suffix, settings, key)
+        completion = request_completion(
+            request_prefix,
+            request_suffix,
+            settings,
+            key,
+            on_retry=retry_indicator.show_from_worker,
+        )
     except Exception:
         completion = ""
     _post_to_ui(
@@ -3411,11 +3498,17 @@ def _continuous_request_worker(doc, key, request_id, request_prefix, request_suf
             request_prefix,
             completion,
             settings,
+            retry_indicator,
         )
     )
 
 
-def _handle_continuous_response(doc, key, request_id, request_prefix, completion, settings):
+def _handle_continuous_response(
+    doc, key, request_id, request_prefix, completion, settings, retry_indicator=None
+):
+    if retry_indicator is not None:
+        retry_indicator.hide()
+
     with _CONTINUOUS_LOCK:
         current = _CONTINUOUS_REQUESTS.get(key)
         if not current or current.get("id") != request_id:
@@ -4288,6 +4381,107 @@ def _status_indicator(doc):
         return frame.createStatusIndicator()
     except Exception:
         return NullStatus()
+
+
+# Shown in the LibreOffice status bar when a reasoning model (for example
+# Gemma 4 served by LM Studio) spends its whole completion budget on
+# reasoning and _request_openai_messages has to retry with a larger budget.
+# The retry itself is automatic; the hint only suggests turning thinking off
+# so suggestions need a single, faster round trip. It stays on screen briefly
+# after the suggestion appears, so it must read correctly in both moments.
+REASONING_RETRY_STATUS_TEXT = (
+    "LibreCompleteAI retried: the model's reasoning used up the token budget. "
+    "Turn off thinking for this model to get faster suggestions."
+)
+
+# Minimum time the hint stays visible once shown. The retry it announces
+# often takes only ~1-1.6s, which would make the message flash by unread.
+REASONING_RETRY_MIN_VISIBLE_SECONDS = 2.0
+
+
+def _monotonic():
+    return time.monotonic()
+
+
+def _schedule_delayed(seconds, callback):
+    """Run callback() after at least `seconds`, on a background timer thread.
+
+    A thin seam over threading.Timer so tests can make this synchronous
+    without actually sleeping.
+    """
+    timer = threading.Timer(seconds, callback)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+class _ReasoningRetryIndicator:
+    """Status-bar hint shown only when a reasoning model forced a retry.
+
+    Used by manual completion, selection revision and continuous suggestions
+    alike. It stays inert under normal conditions, so continuous suggestions
+    remain silent. When a retry happens, show() starts a dedicated status
+    indicator; LibreOffice stacks it on top of any "Generating..." indicator
+    that is already running, so ending that one does not hide the hint.
+    hide() is called once the request is over - by _finish_manual_request for
+    manual requests (success, error or Esc) and by _handle_continuous_response
+    for continuous ones - and ends the hint, but never before it has been
+    visible for REASONING_RETRY_MIN_VISIBLE_SECONDS. show() and hide() run on
+    the UI thread. After hide(), a late show() does nothing.
+    """
+
+    def __init__(self, doc):
+        self._doc = doc
+        self._status = None
+        self._shown_at = None
+        self._closed = False
+
+    def show_from_worker(self):
+        """on_retry hook for request workers: show() on the UI thread."""
+        _post_to_ui(self.show)
+
+    def show(self):
+        if self._closed or self._status is not None:
+            return
+        try:
+            status = _status_indicator(self._doc)
+        except Exception:
+            return
+        # Record the indicator before start(): start() reschedules
+        # LibreOffice's event loop, which can run an already queued hide()
+        # before it returns. hide() must find the indicator to end it.
+        self._status = status
+        self._shown_at = _monotonic()
+        try:
+            status.start(REASONING_RETRY_STATUS_TEXT, 0)
+        except Exception:
+            if self._status is status:
+                self._status = None
+                self._shown_at = None
+
+    def hide(self):
+        """End the hint (after its minimum visible time). Never raises."""
+        self._closed = True
+        status = self._status
+        if status is None:
+            return
+        remaining = REASONING_RETRY_MIN_VISIBLE_SECONDS - (_monotonic() - self._shown_at)
+        self._status = None
+        self._shown_at = None
+        if remaining > 0:
+            try:
+                _schedule_delayed(remaining, lambda: _post_to_ui(lambda: self._end(status)))
+                return
+            except Exception:
+                pass
+        self._end(status)
+
+    @staticmethod
+    def _end(status):
+        try:
+            status.end()
+        except Exception:
+            pass
 
 
 def _message_box(doc, title, message):
